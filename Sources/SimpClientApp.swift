@@ -14,4 +14,5 @@ enum Config {
     static let forumsURL = base.appendingPathComponent("forums/")
     static let latestURL = base.appendingPathComponent("whats-new/posts/")
     static let loginURL = base.appendingPathComponent("login/")
+    static let searchURL = base.appendingPathComponent("search/")
 }
