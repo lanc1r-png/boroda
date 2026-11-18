@@ -22,6 +22,7 @@ final class WebLoader: NSObject, WKNavigationDelegate {
     static let shared = WebLoader()
 
     let webView: WKWebView
+    private(set) var userAgent = ""
     private var navContinuation: CheckedContinuation<Void, Error>?
     private var busy = false
 
@@ -73,6 +74,9 @@ final class WebLoader: NSObject, WKNavigationDelegate {
     private func syncCookies() async {
         let cookies = await webView.configuration.websiteDataStore.httpCookieStore.allCookies()
         for c in cookies { HTTPCookieStorage.shared.setCookie(c) }
+        if userAgent.isEmpty {
+            userAgent = ((try? await webView.evaluateJavaScript("navigator.userAgent")) as? String) ?? ""
+        }
     }
 
     private func waitReady() async throws -> String {

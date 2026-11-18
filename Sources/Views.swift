@@ -99,6 +99,115 @@ final class AuthState {
     }
 }
 
+// MARK: - Images
+
+enum ImageLoader {
+    static let cache = NSCache<NSURL, UIImage>()
+
+    /// Loads with the same cookies / User-Agent / Referer as the in-app browser,
+    /// so hotlink protection and login-only attachments work.
+    static func load(_ url: URL) async throws -> UIImage {
+        if let c = cache.object(forKey: url as NSURL) { return c }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 30
+        req.setValue(Config.base.absoluteString + "/", forHTTPHeaderField: "Referer")
+        let ua = await WebLoader.shared.userAgent
+        if !ua.isEmpty { req.setValue(ua, forHTTPHeaderField: "User-Agent") }
+        req.setValue("image/avif,image/webp,image/apng,image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        if let h = resp as? HTTPURLResponse, !(200..<300).contains(h.statusCode) {
+            throw LoadError.failed("HTTP \(h.statusCode)")
+        }
+        guard let raw = UIImage(data: data) else { throw LoadError.failed("не изображение") }
+        let img = await raw.byPreparingForDisplay() ?? raw
+        cache.setObject(img, forKey: url as NSURL)
+        return img
+    }
+}
+
+struct ViewerImage: Identifiable {
+    let id = UUID()
+    let image: UIImage
+}
+
+struct ImageViewer: View {
+    let image: UIImage
+    @Environment(\.dismiss) private var dismiss
+    @State private var scale: CGFloat = 1
+
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            Color.black.ignoresSafeArea()
+            Image(uiImage: image)
+                .resizable()
+                .scaledToFit()
+                .scaleEffect(scale)
+                .gesture(
+                    MagnifyGesture()
+                        .onChanged { scale = max(1, $0.magnification) }
+                        .onEnded { _ in withAnimation { scale = 1 } }
+                )
+            Button { dismiss() } label: {
+                Image(systemName: "xmark").font(.headline).padding(14)
+            }
+            .glassEffect(.regular.interactive(), in: .circle)
+            .padding()
+        }
+    }
+}
+
+struct RemoteImage: View {
+    let ref: ImageRef
+    let onTap: (UIImage) -> Void
+    @State private var image: UIImage?
+    @State private var failure: String?
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxWidth: .infinity)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .onTapGesture { onTap(image) }
+            } else if let failure {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("Не удалось загрузить (\(failure))", systemImage: "photo")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    HStack(spacing: 16) {
+                        Button("Повторить") { Task { await load() } }
+                            .buttonStyle(.borderless)
+                        if let u = ref.candidates.first {
+                            Link("Открыть в браузере", destination: u)
+                        }
+                    }
+                    .font(.caption)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                ProgressView().frame(maxWidth: .infinity, minHeight: 100)
+            }
+        }
+        .task { if image == nil && failure == nil { await load() } }
+    }
+
+    private func load() async {
+        failure = nil
+        var last = ""
+        for u in ref.candidates {
+            do {
+                image = try await ImageLoader.load(u)
+                return
+            } catch {
+                last = error.localizedDescription
+            }
+        }
+        failure = last
+    }
+}
+
 // MARK: - Root
 
 struct RootView: View {
@@ -295,78 +404,186 @@ struct LatestView: View {
     }
 }
 
-struct ForumThreadsView: View {
-    let forum: Forum
-    @State private var state: LoadState<[ThreadItem]> = .idle
+// MARK: - Pagination
+
+struct PagePicker: View {
+    let pages: Int
+    let onPick: (Int) -> Void
+    @State private var selected: Int
+    @Environment(\.dismiss) private var dismiss
+
+    init(page: Int, pages: Int, onPick: @escaping (Int) -> Void) {
+        self.pages = pages
+        self.onPick = onPick
+        _selected = State(initialValue: page)
+    }
 
     var body: some View {
-        StateView(state: state, retry: load) { items in
-            ThreadListView(items: items, reload: load)
+        VStack(spacing: 8) {
+            Text("Перейти на страницу").font(.headline).padding(.top)
+            Picker("Страница", selection: $selected) {
+                ForEach(1...max(pages, 1), id: \.self) { Text("\($0)").tag($0) }
+            }
+            .pickerStyle(.wheel)
+            Button("Перейти") {
+                onPick(selected)
+                dismiss()
+            }
+            .buttonStyle(.glassProminent)
+            .padding(.bottom)
+        }
+        .padding(.horizontal)
+    }
+}
+
+struct PageBar: View {
+    let page: Int
+    let pages: Int
+    let go: (Int) -> Void
+    @State private var picking = false
+
+    var body: some View {
+        if pages > 1 {
+            GlassEffectContainer(spacing: 10) {
+                HStack(spacing: 10) {
+                    barButton("chevron.left.2", enabled: page > 1) { go(1) }
+                    barButton("chevron.left", enabled: page > 1) { go(page - 1) }
+                    Button { picking = true } label: {
+                        Text("\(page) / \(pages)")
+                            .font(.subheadline.weight(.semibold).monospacedDigit())
+                            .padding(.horizontal, 18)
+                            .padding(.vertical, 11)
+                    }
+                    .buttonStyle(.plain)
+                    .glassEffect(.regular.interactive(), in: .capsule)
+                    barButton("chevron.right", enabled: page < pages) { go(page + 1) }
+                    barButton("chevron.right.2", enabled: page < pages) { go(pages) }
+                }
+            }
+            .padding(.vertical, 6)
+            .sheet(isPresented: $picking) {
+                PagePicker(page: page, pages: pages) { go($0) }
+                    .presentationDetents([.height(340)])
+            }
+        }
+    }
+
+    private func barButton(_ icon: String, enabled: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.subheadline.weight(.semibold))
+                .frame(width: 40, height: 40)
+        }
+        .buttonStyle(.plain)
+        .glassEffect(.regular.interactive(), in: .circle)
+        .opacity(enabled ? 1 : 0.35)
+        .disabled(!enabled)
+    }
+}
+
+struct ForumThreadsView: View {
+    let forum: Forum
+    @State private var items: [ThreadItem] = []
+    @State private var page = 1
+    @State private var pages = 1
+    @State private var target = 1
+    @State private var loading = false
+    @State private var error: String?
+    @State private var scrollKey = 0
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(spacing: 10) {
+                ForEach(items) { t in
+                    NavigationLink(value: t) { ThreadRow(item: t) }.buttonStyle(.plain)
+                }
+                if loading {
+                    ProgressView().padding(40)
+                }
+                if let error {
+                    VStack(spacing: 10) {
+                        Text(error).font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                        Button("Повторить") { Task { await load(target) } }.buttonStyle(.glass)
+                    }
+                    .padding()
+                }
+            }
+            .padding(.horizontal)
+        }
+        .id(scrollKey)
+        .refreshable { await load(page) }
+        .safeAreaInset(edge: .bottom) {
+            PageBar(page: page, pages: pages) { n in Task { await load(n) } }
         }
         .navigationTitle(forum.title)
         .navigationBarTitleDisplayMode(.inline)
-        .task { if case .idle = state { await load() } }
+        .task { if items.isEmpty && error == nil && !loading { await load(1) } }
     }
 
-    private func load() async {
-        state = .loading
-        state = await fetch(forum.url, Parser.threads)
+    private func load(_ n: Int) async {
+        guard !loading else { return }
+        loading = true
+        error = nil
+        target = n
+        items = []
+        let url = n == 1 ? forum.url : forum.url.appendingPathComponent("page-\(n)")
+        let result = await fetch(url, Parser.threads)
+        switch result {
+        case .loaded(let r):
+            items = r.items
+            pages = max(r.pages, pages, n)
+            page = n
+            scrollKey += 1
+        case .failed(let m):
+            error = m
+        default:
+            break
+        }
+        loading = false
     }
 }
 
 // MARK: - Thread
 
-struct IdentURL: Identifiable {
-    let url: URL
-    var id: String { url.absoluteString }
-}
-
-struct ImageViewer: View {
-    let url: URL
-    @Environment(\.dismiss) private var dismiss
-    @State private var scale: CGFloat = 1
+struct QuoteView: View {
+    let author: String
+    let text: AttributedString
 
     var body: some View {
-        ZStack(alignment: .topTrailing) {
-            Color.black.ignoresSafeArea()
-            AsyncImage(url: url) { phase in
-                if let img = phase.image {
-                    img.resizable().scaledToFit()
-                        .scaleEffect(scale)
-                        .gesture(
-                            MagnifyGesture()
-                                .onChanged { scale = max(1, $0.magnification) }
-                                .onEnded { _ in withAnimation { scale = 1 } }
-                        )
-                } else if phase.error != nil {
-                    Text("Не удалось загрузить").foregroundStyle(.white)
-                } else {
-                    ProgressView()
+        HStack(alignment: .top, spacing: 8) {
+            RoundedRectangle(cornerRadius: 2).fill(Color.accentColor).frame(width: 3)
+            VStack(alignment: .leading, spacing: 4) {
+                if !author.isEmpty {
+                    Text(author).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                 }
+                Text(text).font(.footnote).foregroundStyle(.secondary).lineLimit(12)
             }
-            Button { dismiss() } label: {
-                Image(systemName: "xmark").font(.headline).padding(14)
-            }
-            .glassEffect(.regular.interactive(), in: .circle)
-            .padding()
         }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 }
 
 struct PostView: View {
     let post: Post
-    @State private var viewing: IdentURL?
+    let onImage: (UIImage) -> Void
 
     var body: some View {
         Card {
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 10) {
                 HStack {
                     Text(post.author).font(.subheadline.weight(.bold))
                     Spacer()
                     Text(post.date).font(.caption).foregroundStyle(.secondary)
                 }
-                if !post.text.characters.isEmpty {
-                    Text(post.text).textSelection(.enabled)
+                ForEach(Array(post.parts.enumerated()), id: \.offset) { _, part in
+                    switch part {
+                    case .text(let t):
+                        Text(t)
+                    case .quote(let author, let t):
+                        QuoteView(author: author, text: t)
+                    }
                 }
                 ForEach(post.cards) { card in
                     Link(destination: card.url) {
@@ -382,57 +599,49 @@ struct PostView: View {
                         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                     }
                 }
-                ForEach(post.images, id: \.self) { url in
-                    AsyncImage(url: url) { phase in
-                        switch phase {
-                        case .success(let img):
-                            img.resizable().scaledToFit()
-                                .frame(maxWidth: .infinity, maxHeight: 520)
-                                .clipShape(RoundedRectangle(cornerRadius: 12))
-                                .onTapGesture { viewing = IdentURL(url: url) }
-                        case .failure:
-                            Link(destination: url) {
-                                Label("Открыть изображение", systemImage: "photo").font(.caption)
-                            }
-                        default:
-                            ProgressView().frame(maxWidth: .infinity, minHeight: 80)
-                        }
-                    }
+                ForEach(post.images) { ref in
+                    RemoteImage(ref: ref, onTap: onImage)
                 }
             }
         }
-        .fullScreenCover(item: $viewing) { ImageViewer(url: $0.url) }
     }
 }
 
 struct ThreadView: View {
     let item: ThreadItem
     @State private var posts: [Post] = []
-    @State private var page = 0
+    @State private var page = 1
     @State private var pages = 1
+    @State private var target = 1
     @State private var loading = false
     @State private var error: String?
     @State private var canonical: URL?
+    @State private var scrollKey = 0
+    @State private var viewer: ViewerImage?
     private let store = BookmarkStore.shared
 
     var body: some View {
         ScrollView {
             LazyVStack(spacing: 10) {
-                ForEach(posts) { PostView(post: $0) }
-                if let error {
-                    Text(error).font(.footnote).foregroundStyle(.secondary).padding()
+                ForEach(posts) { p in
+                    PostView(post: p) { viewer = ViewerImage(image: $0) }
                 }
                 if loading {
-                    ProgressView().padding()
-                } else if page < pages || (posts.isEmpty && error != nil) {
-                    Button(posts.isEmpty ? "Повторить" : "Загрузить ещё (\(page)/\(pages))") {
-                        Task { await loadNext() }
+                    ProgressView().padding(40)
+                }
+                if let error {
+                    VStack(spacing: 10) {
+                        Text(error).font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                        Button("Повторить") { Task { await load(target) } }.buttonStyle(.glass)
                     }
-                    .buttonStyle(.glass)
                     .padding()
                 }
             }
             .padding(.horizontal)
+        }
+        .id(scrollKey)
+        .safeAreaInset(edge: .bottom) {
+            PageBar(page: page, pages: pages) { n in Task { await load(n) } }
         }
         .navigationTitle(item.title)
         .navigationBarTitleDisplayMode(.inline)
@@ -445,33 +654,37 @@ struct ThreadView: View {
                 }
             }
         }
-        .task { if posts.isEmpty { await loadNext() } }
+        .fullScreenCover(item: $viewer) { ImageViewer(image: $0.image) }
+        .task { if posts.isEmpty && error == nil && !loading { await load(1) } }
     }
 
-    private func loadNext() async {
+    private func load(_ n: Int) async {
         guard !loading else { return }
         loading = true
         error = nil
-        let next = page + 1
-        let url = next == 1 ? item.url : (canonical ?? item.url).appendingPathComponent("page-\(next)")
+        target = n
+        posts = []
+        let base = canonical ?? item.url
+        let url = (canonical != nil && n > 1) ? base.appendingPathComponent("page-\(n)") : base
         let result = await fetch(url, Parser.posts)
         switch result {
         case .loaded(let r):
-            posts.append(contentsOf: r.posts)
-            pages = r.pages
-            page = next
-            if next == 1, let cur = WebLoader.shared.webView.url {
+            posts = r.posts
+            pages = max(r.pages, 1)
+            page = n
+            scrollKey += 1
+            if canonical == nil, let cur = WebLoader.shared.webView.url {
                 // Links like /posts/123/ redirect to /threads/slug/page-N: normalise.
-                var base = cur
                 var comps = URLComponents(url: cur, resolvingAgainstBaseURL: false)
                 comps?.fragment = nil
                 comps?.query = nil
-                base = comps?.url ?? cur
-                if base.lastPathComponent.hasPrefix("page-") {
-                    page = Int(base.lastPathComponent.dropFirst(5)) ?? 1
-                    base = base.deletingLastPathComponent()
+                var b = comps?.url ?? cur
+                if b.lastPathComponent.hasPrefix("page-") {
+                    page = Int(b.lastPathComponent.dropFirst(5)) ?? n
+                    pages = max(pages, page)
+                    b = b.deletingLastPathComponent()
                 }
-                canonical = base
+                canonical = b
             }
         case .failed(let m):
             error = m
