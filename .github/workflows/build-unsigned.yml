@@ -1,0 +1,42 @@
+name: Build unsigned IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Xcode version
+        run: xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate project
+        run: xcodegen generate
+
+      - name: Archive (no signing)
+        run: |
+          xcodebuild archive \
+            -project SimpClient.xcodeproj \
+            -scheme SimpClient \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/SimpClient.xcarchive" \
+            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO
+
+      - name: Package IPA
+        run: |
+          mkdir -p Payload
+          cp -R "$RUNNER_TEMP/SimpClient.xcarchive/Products/Applications/SimpClient.app" Payload/
+          zip -qry SimpClient-unsigned.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SimpClient-unsigned-ipa
+          path: SimpClient-unsigned.ipa
