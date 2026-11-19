@@ -386,7 +386,7 @@ enum Parser {
         return out
     }
 
-    static func looksLikeImage(_ href: String) -> Bool {
+    private static func looksLikeImage(_ href: String) -> Bool {
         let l = href.lowercased()
         return [".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", "/attachments/"].contains { l.contains($0) }
     }
@@ -447,15 +447,9 @@ enum Parser {
                    let href = try? parent.attr("href"), !href.isEmpty {
                     if looksLikeImage(href) {
                         raw.append(href)
-                    } else if var u = abs(href) {
-                        // XenForo image proxy: /proxy.php?link=<original>
-                        if u.host == Config.base.host,
-                           let c = URLComponents(url: u, resolvingAgainstBaseURL: false),
-                           let l = c.queryItems?.first(where: { $0.name == "link" })?.value,
-                           let o = URL(string: l) { u = o }
-                        if u.host != Config.base.host, u.scheme?.hasPrefix("http") == true {
-                            pageLinks.append(u)
-                        }
+                    } else if let u = abs(href), u.host != Config.base.host,
+                              u.scheme?.hasPrefix("http") == true {
+                        pageLinks.append(u)
                     }
                 }
                 for key in ["data-url", "data-src", "src"] {

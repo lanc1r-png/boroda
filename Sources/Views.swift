@@ -249,48 +249,24 @@ enum ImageLoader {
 
 extension ImageLoader {
     /// For links wrapped around a thumbnail: read the image host page and return its og:image.
-    static func resolvePage(_ url: URL) async -> URL? { await resolveAll(url).first }
-
-    /// All plausible full-size picture URLs found on an image-host page, best guess first.
-    static func resolveAll(_ url: URL) async -> [URL] {
-        var html: String?
+    static func resolvePage(_ url: URL) async -> URL? {
         var req = URLRequest(url: url)
         req.timeoutInterval = 20
         req.setValue(Config.base.absoluteString + "/", forHTTPHeaderField: "Referer")
         let ua = await WebLoader.shared.userAgent
         if !ua.isEmpty { req.setValue(ua, forHTTPHeaderField: "User-Agent") }
-        if let (data, resp) = try? await URLSession.shared.data(for: req),
-           (resp as? HTTPURLResponse)?.statusCode == 200,
-           let h = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1),
-           !h.contains("Just a moment") {
-            html = h
-        }
-        if html == nil { html = try? await WebLoader.shared.html(url) }
-        guard let html, let doc = try? SwiftSoup.parse(html, url.absoluteString) else { return [] }
-        var out: [URL] = []
-        func add(_ v: String?) {
-            guard let v, !v.isEmpty, !v.hasPrefix("data:"),
-                  let u = URL(string: v, relativeTo: url)?.absoluteURL, !out.contains(u) else { return }
-            out.append(u)
-        }
-        for el in (try? doc.select("a[download], a[href*=download], a[href*=/data/], a[href*=/full]").array()) ?? [] {
-            if let h = try? el.attr("href"), Parser.looksLikeImage(h) || (try? el.hasAttr("download")) == true { add(h) }
-        }
+        guard let (data, _) = try? await URLSession.shared.data(for: req),
+              let html = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1),
+              let doc = try? SwiftSoup.parse(html) else { return nil }
         for sel in ["meta[property=og:image]", "meta[name=twitter:image]", "link[rel=image_src]"] {
             guard let el = try? doc.select(sel).first() else { continue }
-            add(try? el.attr(el.tagName() == "link" ? "href" : "content"))
+            let attr = el.tagName() == "link" ? "href" : "content"
+            if let v = try? el.attr(attr), !v.isEmpty,
+               let u = URL(string: v, relativeTo: url)?.absoluteURL {
+                return u
+            }
         }
-        // Largest-looking <img> on the page (declared size, else document order)
-        let imgs = (try? doc.select("img").array()) ?? []
-        let ranked = imgs.sorted {
-            let w0 = Int((try? $0.attr("width")) ?? "") ?? 0
-            let w1 = Int((try? $1.attr("width")) ?? "") ?? 0
-            return w0 > w1
-        }
-        for img in ranked.prefix(4) {
-            for key in ["data-src", "data-full", "src"] { add(try? img.attr(key)) }
-        }
-        return out
+        return nil
     }
 }
 
@@ -453,7 +429,7 @@ struct ImageViewer: View {
         defer { searching = false }
         var urls = ref.candidates
         for pg in ref.pages.prefix(2) {
-            for u in await ImageLoader.resolveAll(pg).prefix(6) where !urls.contains(u) { urls.insert(u, at: 0) }
+            if let u = await ImageLoader.resolvePage(pg), !urls.contains(u) { urls.insert(u, at: 0) }
         }
         var bestPixels = current.size.width * current.scale * current.size.height * current.scale
         for u in urls {
