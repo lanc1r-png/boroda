@@ -181,11 +181,11 @@ final class ImageWebFetcher: NSObject, WKNavigationDelegate {
         var i = document.images[0];
         if (!i || !i.complete) return 'wait:noimg';
         var w = i.naturalWidth, h = i.naturalHeight;
-        var s = Math.min(1, 2400 / Math.max(w, h));
+        var s = Math.min(1, 4096 / Math.max(w, h));
         var c = document.createElement('canvas');
         c.width = Math.round(w * s); c.height = Math.round(h * s);
         c.getContext('2d').drawImage(i, 0, 0, c.width, c.height);
-        return c.toDataURL('image/jpeg', 0.9);
+        return c.toDataURL('image/jpeg', 0.95);
       } catch (e) { return 'err:' + e; }
     })()
     """

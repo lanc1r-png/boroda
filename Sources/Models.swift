@@ -193,6 +193,25 @@ enum Parser {
         return (loggedIn, name)
     }
 
+    /// Image hosts (Chevereto etc.) serve thumbnails as name.md.jpg / name.th.jpg; the original is name.jpg.
+    static func fullSizeVariants(_ u: URL) -> [URL] {
+        var out: [URL] = []
+        let s = u.absoluteString
+        for tag in [".md.", ".th.", ".thumb.", ".small.", ".medium.", ".lg."] where s.contains(tag) {
+            if let v = URL(string: s.replacingOccurrences(of: tag, with: ".")) { out.append(v) }
+        }
+        // size-limiting query parameters
+        if var c = URLComponents(url: u, resolvingAgainstBaseURL: false), let items = c.queryItems {
+            let drop = ["w", "h", "width", "height", "size", "resize", "thumb"]
+            let kept = items.filter { !drop.contains($0.name.lowercased()) }
+            if kept.count != items.count {
+                c.queryItems = kept.isEmpty ? nil : kept
+                if let v = c.url { out.append(v) }
+            }
+        }
+        return out
+    }
+
     private static func looksLikeImage(_ href: String) -> Bool {
         let l = href.lowercased()
         return [".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", "/attachments/"].contains { l.contains($0) }
@@ -237,7 +256,9 @@ enum Parser {
                 }
                 var cands: [URL] = []
                 for s in raw {
-                    if let u = abs(s), !cands.contains(u) { cands.append(u) }
+                    guard let u = abs(s) else { continue }
+                    // Full-size guesses first, then the URL as given
+                    for v in fullSizeVariants(u) + [u] where !cands.contains(v) { cands.append(v) }
                 }
                 if cands.isEmpty { continue }
                 if images.contains(where: { $0.candidates.first == cands.first }) { continue }

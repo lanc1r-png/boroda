@@ -1,5 +1,6 @@
 import SwiftUI
 import Observation
+import Translation
 
 // MARK: - Helpers
 
@@ -99,6 +100,108 @@ final class AuthState {
     }
 }
 
+// MARK: - Translation (on-device, Apple Translation framework)
+
+@Observable
+@MainActor
+final class TranslationStore {
+    static let shared = TranslationStore()
+    var enabled = false
+    var busy = false
+    var lastError: String?
+    var cache: [String: String] = [:]
+    var configuration: TranslationSession.Configuration?
+    private var pending: Set<String> = []
+
+    static func key(_ s: String) -> String { s.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+    /// Russian text if translation is on and already available.
+    func translated(_ s: String) -> String? {
+        guard enabled else { return nil }
+        return cache[Self.key(s)]
+    }
+
+    func tr(_ s: String) -> String { translated(s) ?? s }
+
+    func request(_ texts: [String]) {
+        let new = Set(texts.map(Self.key).filter { !$0.isEmpty && cache[$0] == nil })
+        guard !new.isEmpty else { return }
+        pending.formUnion(new)
+        trigger()
+    }
+
+    private func trigger() {
+        if configuration == nil {
+            configuration = TranslationSession.Configuration(
+                source: Locale.Language(identifier: "en"),
+                target: Locale.Language(identifier: "ru"))
+        } else {
+            configuration?.invalidate()
+        }
+    }
+
+    func run(_ session: TranslationSession) async {
+        let batch = Array(pending)
+        pending.removeAll()
+        guard !batch.isEmpty else { return }
+        busy = true
+        defer { busy = false }
+        do {
+            var i = 0
+            while i < batch.count {
+                let chunk = Array(batch[i..<min(i + 25, batch.count)])
+                let reqs = chunk.map { TranslationSession.Request(sourceText: $0) }
+                let responses = try await session.translations(from: reqs)
+                for r in responses { cache[Self.key(r.sourceText)] = r.targetText }
+                i += 25
+            }
+            lastError = nil
+        } catch {
+            lastError = error.localizedDescription
+        }
+        if !pending.isEmpty { trigger() }
+    }
+}
+
+struct TranslateButton: View {
+    private let store = TranslationStore.shared
+    var body: some View {
+        Button {
+            store.enabled.toggle()
+        } label: {
+            if store.busy {
+                ProgressView()
+            } else if store.enabled && store.lastError != nil {
+                Image(systemName: "exclamationmark.triangle")
+            } else {
+                Image(systemName: store.enabled ? "character.bubble.fill" : "character.bubble")
+            }
+        }
+        .accessibilityLabel("Перевести на русский")
+    }
+}
+
+struct TranslateTexts: ViewModifier {
+    let texts: [String]
+    private let store = TranslationStore.shared
+
+    struct Key: Equatable {
+        let enabled: Bool
+        let hash: Int
+    }
+
+    func body(content: Content) -> some View {
+        content.task(id: Key(enabled: store.enabled, hash: texts.hashValue)) {
+            if store.enabled { store.request(texts) }
+        }
+    }
+}
+
+extension View {
+    /// Registers the visible English texts of a screen for translation while translation is on.
+    func translateTexts(_ texts: [String]) -> some View { modifier(TranslateTexts(texts: texts)) }
+}
+
 // MARK: - Images
 
 enum ImageLoader {
@@ -135,13 +238,28 @@ struct ViewerImage: Identifiable {
     let image: UIImage
 }
 
+final class PhotoSaver: NSObject, ObservableObject {
+    @Published var status: String?
+
+    func save(_ image: UIImage) {
+        UIImageWriteToSavedPhotosAlbum(image, self, #selector(done(_:didFinishSavingWithError:contextInfo:)), nil)
+    }
+
+    @objc private func done(_ image: UIImage, didFinishSavingWithError error: Error?, contextInfo: UnsafeRawPointer) {
+        status = error == nil ? "Сохранено в «Фото»" : "Не удалось сохранить: \(error!.localizedDescription)"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in self?.status = nil }
+    }
+}
+
 struct ImageViewer: View {
     let image: UIImage
     @Environment(\.dismiss) private var dismiss
     @State private var scale: CGFloat = 1
+    @State private var lastScale: CGFloat = 1
+    @StateObject private var saver = PhotoSaver()
 
     var body: some View {
-        ZStack(alignment: .topTrailing) {
+        ZStack {
             Color.black.ignoresSafeArea()
             Image(uiImage: image)
                 .resizable()
@@ -149,14 +267,47 @@ struct ImageViewer: View {
                 .scaleEffect(scale)
                 .gesture(
                     MagnifyGesture()
-                        .onChanged { scale = max(1, $0.magnification) }
-                        .onEnded { _ in withAnimation { scale = 1 } }
+                        .onChanged { scale = min(8, max(1, lastScale * $0.magnification)) }
+                        .onEnded { _ in lastScale = scale }
                 )
-            Button { dismiss() } label: {
-                Image(systemName: "xmark").font(.headline).padding(14)
+                .onTapGesture(count: 2) {
+                    withAnimation { scale = scale > 1 ? 1 : 2.5; lastScale = scale }
+                }
+
+            VStack {
+                HStack {
+                    Spacer()
+                    Button { dismiss() } label: {
+                        Image(systemName: "xmark").font(.headline).padding(14)
+                    }
+                    .glassEffect(.regular.interactive(), in: .circle)
+                }
+                .padding()
+                Spacer()
+                if let s = saver.status {
+                    Text(s).font(.footnote).padding(10)
+                        .glassEffect(.regular, in: .capsule)
+                }
+                GlassEffectContainer(spacing: 12) {
+                    HStack(spacing: 12) {
+                        Button { saver.save(image) } label: {
+                            Label("Сохранить", systemImage: "arrow.down.to.line")
+                                .padding(.horizontal, 14).padding(.vertical, 10)
+                        }
+                        .buttonStyle(.plain)
+                        .glassEffect(.regular.interactive(), in: .capsule)
+
+                        ShareLink(item: Image(uiImage: image),
+                                  preview: SharePreview("Изображение", image: Image(uiImage: image))) {
+                            Label("Поделиться", systemImage: "square.and.arrow.up")
+                                .padding(.horizontal, 14).padding(.vertical, 10)
+                        }
+                        .buttonStyle(.plain)
+                        .glassEffect(.regular.interactive(), in: .capsule)
+                    }
+                }
+                .padding(.bottom, 24)
             }
-            .glassEffect(.regular.interactive(), in: .circle)
-            .padding()
         }
     }
 }
@@ -206,17 +357,26 @@ struct RemoteImage: View {
             e is CancellationError || (e as? URLError)?.code == .cancelled
         }
 
+        func pixels(_ i: UIImage) -> CGFloat { i.size.width * i.scale }
+
+        // Candidates are ordered full-size first. Keep the sharpest one; stop early once it is large enough.
+        var best: UIImage?
         for u in ref.candidates {
             do {
-                image = try await ImageLoader.load(u)
-                return
+                let img = try await ImageLoader.load(u)
+                if best == nil || pixels(img) > pixels(best!) { best = img }
+                if pixels(img) >= 1000 { break }
             } catch {
                 if isCancel(error) { return }   // view scrolled away: retry on reappear
                 notes.append(error.localizedDescription)
             }
         }
+        if let best {
+            image = best
+            return
+        }
         // Fallback: let the in-app browser fetch it (cookies, Cloudflare, Referer)
-        for u in ref.candidates.prefix(2) {
+        for u in ref.candidates.prefix(3) {
             do {
                 let img = try await ImageWebFetcher.shared.fetch(u)
                 ImageLoader.cache.setObject(img, forKey: u as NSURL)
@@ -242,6 +402,9 @@ struct RootView: View {
             Tab("Поиск", systemImage: "magnifyingglass", role: .search) { SearchView() }
         }
         .tabBarMinimizeBehavior(.onScrollDown)
+        .translationTask(TranslationStore.shared.configuration) { session in
+            await TranslationStore.shared.run(session)
+        }
         .task { await AuthState.shared.refresh() }
     }
 }
@@ -265,6 +428,7 @@ struct SearchView: View {
                 }
             }
             .navigationTitle("Поиск")
+            .toolbar { ToolbarItem(placement: .topBarTrailing) { TranslateButton() } }
             .navigationDestination(for: ThreadItem.self) { ThreadView(item: $0) }
         }
         .searchable(text: $query, prompt: "Название темы")
@@ -330,6 +494,7 @@ struct HomeView: View {
             }
             .navigationTitle("SimpClient")
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .topBarTrailing) { TranslateButton() } }
             .navigationDestination(for: Forum.self) { ForumThreadsView(forum: $0) }
             .navigationDestination(for: ThreadItem.self) { ThreadView(item: $0) }
         }
@@ -348,6 +513,7 @@ struct Card<Content: View>: View {
 
 struct ForumsView: View {
     @State private var state: LoadState<[Forum]> = .idle
+    private let tx = TranslationStore.shared
 
     var body: some View {
         StateView(state: state, retry: load) { forums in
@@ -357,9 +523,9 @@ struct ForumsView: View {
                         NavigationLink(value: f) {
                             Card {
                                 VStack(alignment: .leading, spacing: 4) {
-                                    Text(f.title).font(.headline)
+                                    Text(tx.tr(f.title)).font(.headline)
                                     if !f.desc.isEmpty {
-                                        Text(f.desc).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                                        Text(tx.tr(f.desc)).font(.caption).foregroundStyle(.secondary).lineLimit(2)
                                     }
                                 }
                             }
@@ -370,6 +536,7 @@ struct ForumsView: View {
                 .padding(.horizontal)
             }
             .refreshable { await load() }
+            .translateTexts(forums.flatMap { [$0.title, $0.desc] })
         }
         .task { if case .idle = state { await load() } }
     }
@@ -382,13 +549,14 @@ struct ForumsView: View {
 
 struct ThreadRow: View {
     let item: ThreadItem
+    private let tx = TranslationStore.shared
     var body: some View {
         Card {
             VStack(alignment: .leading, spacing: 4) {
-                Text(item.title).font(.headline).multilineTextAlignment(.leading)
+                Text(tx.tr(item.title)).font(.headline).multilineTextAlignment(.leading)
                 HStack {
                     if !item.author.isEmpty { Text(item.author).font(.caption.weight(.semibold)) }
-                    Text(item.meta).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                    Text(tx.tr(item.meta)).font(.caption).foregroundStyle(.secondary).lineLimit(2)
                 }
             }
         }
@@ -408,6 +576,7 @@ struct ThreadListView: View {
             .padding(.horizontal)
         }
         .refreshable { await reload() }
+        .translateTexts(items.map(\.title) + items.map(\.meta).filter { !$0.hasPrefix("Ответов") })
     }
 }
 
@@ -532,8 +701,10 @@ struct ForumThreadsView: View {
         .id(scrollKey)
         .refreshable { await load(page) }
         .pageToolbar(page: page, pages: pages) { n in Task { await load(n) } }
-        .navigationTitle(forum.title)
+        .navigationTitle(TranslationStore.shared.tr(forum.title))
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar { ToolbarItem(placement: .topBarTrailing) { TranslateButton() } }
+        .translateTexts([forum.title] + items.map(\.title))
         .task { if items.isEmpty && error == nil && !loading { await load(1) } }
     }
 
@@ -565,6 +736,7 @@ struct ForumThreadsView: View {
 struct QuoteView: View {
     let author: String
     let text: AttributedString
+    private let tx = TranslationStore.shared
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
@@ -573,7 +745,10 @@ struct QuoteView: View {
                 if !author.isEmpty {
                     Text(author).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                 }
-                Text(text).font(.footnote).foregroundStyle(.secondary).lineLimit(12)
+                Group {
+                    if let tt = tx.translated(String(text.characters)) { Text(tt) } else { Text(text) }
+                }
+                .font(.footnote).foregroundStyle(.secondary).lineLimit(12)
             }
         }
         .padding(10)
@@ -585,6 +760,7 @@ struct QuoteView: View {
 struct PostView: View {
     let post: Post
     let onImage: (UIImage) -> Void
+    private let tx = TranslationStore.shared
 
     var body: some View {
         Card {
@@ -597,7 +773,7 @@ struct PostView: View {
                 ForEach(Array(post.parts.enumerated()), id: \.offset) { _, part in
                     switch part {
                     case .text(let t):
-                        Text(t)
+                        if let tt = tx.translated(String(t.characters)) { Text(tt) } else { Text(t) }
                     case .quote(let author, let t):
                         QuoteView(author: author, text: t)
                     }
@@ -636,6 +812,18 @@ struct ThreadView: View {
     @State private var scrollKey = 0
     @State private var viewer: ViewerImage?
     private let store = BookmarkStore.shared
+    private let tx = TranslationStore.shared
+
+    private var allTexts: [String] {
+        [item.title] + posts.flatMap { p in
+            p.parts.map { part -> String in
+                switch part {
+                case .text(let t): return String(t.characters)
+                case .quote(_, let t): return String(t.characters)
+                }
+            }
+        }
+    }
 
     var body: some View {
         ScrollView {
@@ -658,10 +846,12 @@ struct ThreadView: View {
         }
         .id(scrollKey)
         .pageToolbar(page: page, pages: pages) { n in Task { await load(n) } }
-        .navigationTitle(item.title)
+        .navigationTitle(tx.tr(item.title))
         .navigationBarTitleDisplayMode(.inline)
+        .translateTexts(allTexts)
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                TranslateButton()
                 Button {
                     store.toggle(item)
                 } label: {
