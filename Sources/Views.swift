@@ -1,6 +1,7 @@
 import SwiftUI
 import Observation
 import Translation
+import SwiftSoup
 
 // MARK: - Helpers
 
@@ -233,6 +234,29 @@ enum ImageLoader {
     }
 }
 
+extension ImageLoader {
+    /// For links wrapped around a thumbnail: read the image host page and return its og:image.
+    static func resolvePage(_ url: URL) async -> URL? {
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 20
+        req.setValue(Config.base.absoluteString + "/", forHTTPHeaderField: "Referer")
+        let ua = await WebLoader.shared.userAgent
+        if !ua.isEmpty { req.setValue(ua, forHTTPHeaderField: "User-Agent") }
+        guard let (data, _) = try? await URLSession.shared.data(for: req),
+              let html = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1),
+              let doc = try? SwiftSoup.parse(html) else { return nil }
+        for sel in ["meta[property=og:image]", "meta[name=twitter:image]", "link[rel=image_src]"] {
+            guard let el = try? doc.select(sel).first() else { continue }
+            let attr = el.tagName() == "link" ? "href" : "content"
+            if let v = try? el.attr(attr), !v.isEmpty,
+               let u = URL(string: v, relativeTo: url)?.absoluteURL {
+                return u
+            }
+        }
+        return nil
+    }
+}
+
 struct ViewerImage: Identifiable {
     let id = UUID()
     let image: UIImage
@@ -369,6 +393,15 @@ struct RemoteImage: View {
             } catch {
                 if isCancel(error) { return }   // view scrolled away: retry on reappear
                 notes.append(error.localizedDescription)
+            }
+        }
+        // Thumbnail wrapped in a link to an image-host page: take the page's og:image (full size)
+        if best == nil || pixels(best!) < 1000 {
+            for pg in ref.pages.prefix(2) {
+                guard let u = await ImageLoader.resolvePage(pg),
+                      let img = try? await ImageLoader.load(u) else { continue }
+                if best == nil || pixels(img) > pixels(best!) { best = img }
+                if pixels(img) >= 1000 { break }
             }
         }
         if let best {
@@ -840,10 +873,16 @@ struct PostView: View {
     private var card: some View {
         Card {
             VStack(alignment: .leading, spacing: 10) {
-                HStack {
+                HStack(spacing: 10) {
                     Text(post.author).font(.subheadline.weight(.bold))
                     Spacer()
                     Text(post.date).font(.caption).foregroundStyle(.secondary)
+                    if let link = post.permalink {
+                        Link(destination: link) {
+                            Image(systemName: "safari").font(.body).padding(4)
+                        }
+                        .accessibilityLabel("Открыть это сообщение на сайте")
+                    }
                 }
                 ForEach(Array(post.parts.enumerated()), id: \.offset) { _, part in
                     switch part {

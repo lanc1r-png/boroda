@@ -32,6 +32,8 @@ enum PostPart {
 struct ImageRef: Identifiable {
     let id = UUID()
     let candidates: [URL]
+    /// Image-host pages (e.g. a link wrapped around the thumbnail) whose og:image is the full-size picture.
+    var pages: [URL] = []
 }
 
 struct Post: Identifiable {
@@ -42,6 +44,11 @@ struct Post: Identifiable {
     let parts: [PostPart]
     let images: [ImageRef]
     let cards: [LinkCard]
+
+    /// Link to this exact message on the site (XenForo redirects /posts/ID/ to the right page).
+    var permalink: URL? {
+        postID.allSatisfy(\.isNumber) ? Config.base.appendingPathComponent("posts/\(postID)/") : nil
+    }
 }
 
 // MARK: - Parser (XenForo 2 selectors; tweak here if the markup differs)
@@ -201,6 +208,27 @@ enum Parser {
         for tag in [".md.", ".th.", ".thumb.", ".small.", ".medium.", ".lg."] where s.contains(tag) {
             if let v = URL(string: s.replacingOccurrences(of: tag, with: ".")) { out.append(v) }
         }
+        let host = u.host ?? ""
+        // imgbox: thumbnail _t -> original _o
+        if host.contains("imgbox"), s.contains("_t."), let v = URL(string: s.replacingOccurrences(of: "_t.", with: "_o.")) {
+            out.append(v)
+        }
+        // imgur: id + one size letter (s, t, m, l, h) -> plain id
+        if host == "i.imgur.com" {
+            let name = u.deletingPathExtension().lastPathComponent
+            if [6, 8].contains(name.count), let last = name.last, "stmlhb".contains(last) {
+                out.append(u.deletingLastPathComponent()
+                    .appendingPathComponent(String(name.dropLast()))
+                    .appendingPathExtension(u.pathExtension))
+            }
+        }
+        // XenForo image proxy: the original URL is in ?image=
+        if u.path.hasSuffix("proxy.php"),
+           let items = URLComponents(url: u, resolvingAgainstBaseURL: false)?.queryItems,
+           let orig = items.first(where: { $0.name == "image" })?.value,
+           let v = URL(string: orig) {
+            out.insert(v, at: 0)
+        }
         // size-limiting query parameters
         if var c = URLComponents(url: u, resolvingAgainstBaseURL: false), let items = c.queryItems {
             let drop = ["w", "h", "width", "height", "size", "resize", "thumb"]
@@ -269,9 +297,15 @@ enum Parser {
                 if w < 100 || h < 100 { continue }
 
                 var raw: [String] = []
+                var pageLinks: [URL] = []
                 if let parent = img.parent(), parent.tagName() == "a",
-                   let href = try? parent.attr("href"), looksLikeImage(href) {
-                    raw.append(href)
+                   let href = try? parent.attr("href"), !href.isEmpty {
+                    if looksLikeImage(href) {
+                        raw.append(href)
+                    } else if let u = abs(href), u.host != Config.base.host,
+                              u.scheme?.hasPrefix("http") == true {
+                        pageLinks.append(u)
+                    }
                 }
                 for key in ["data-url", "data-src", "src"] {
                     if let v = try? img.attr(key), !v.isEmpty, !v.hasPrefix("data:") { raw.append(v) }
@@ -284,7 +318,7 @@ enum Parser {
                 }
                 if cands.isEmpty { continue }
                 if images.contains(where: { $0.candidates.first == cands.first }) { continue }
-                images.append(ImageRef(candidates: cands))
+                images.append(ImageRef(candidates: cands, pages: pageLinks))
             }
 
             var r = Rendered()
