@@ -115,10 +115,15 @@ enum ImageLoader {
         if !ua.isEmpty { req.setValue(ua, forHTTPHeaderField: "User-Agent") }
         req.setValue("image/avif,image/webp,image/apng,image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
         let (data, resp) = try await URLSession.shared.data(for: req)
-        if let h = resp as? HTTPURLResponse, !(200..<300).contains(h.statusCode) {
-            throw LoadError.failed("HTTP \(h.statusCode)")
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        let ct = (resp as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type") ?? "?"
+        let host = url.host ?? "?"
+        if !(200..<300).contains(code) {
+            throw LoadError.failed("\(host): HTTP \(code) \(ct)")
         }
-        guard let raw = UIImage(data: data) else { throw LoadError.failed("не изображение") }
+        guard let raw = UIImage(data: data) else {
+            throw LoadError.failed("\(host): HTTP \(code) \(ct) \(data.count / 1024) KB")
+        }
         let img = await raw.byPreparingForDisplay() ?? raw
         cache.setObject(img, forKey: url as NSURL)
         return img
@@ -173,7 +178,7 @@ struct RemoteImage: View {
                     .onTapGesture { onTap(image) }
             } else if let failure {
                 VStack(alignment: .leading, spacing: 6) {
-                    Label("Не удалось загрузить (\(failure))", systemImage: "photo")
+                    Label("Не удалось загрузить:\n\(failure)", systemImage: "photo")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     HStack(spacing: 16) {
@@ -195,16 +200,34 @@ struct RemoteImage: View {
 
     private func load() async {
         failure = nil
-        var last = ""
+        var notes: [String] = []
+
+        func isCancel(_ e: Error) -> Bool {
+            e is CancellationError || (e as? URLError)?.code == .cancelled
+        }
+
         for u in ref.candidates {
             do {
                 image = try await ImageLoader.load(u)
                 return
             } catch {
-                last = error.localizedDescription
+                if isCancel(error) { return }   // view scrolled away: retry on reappear
+                notes.append(error.localizedDescription)
             }
         }
-        failure = last
+        // Fallback: let the in-app browser fetch it (cookies, Cloudflare, Referer)
+        for u in ref.candidates.prefix(2) {
+            do {
+                let img = try await ImageWebFetcher.shared.fetch(u)
+                ImageLoader.cache.setObject(img, forKey: u as NSURL)
+                image = img
+                return
+            } catch {
+                if isCancel(error) { return }
+                notes.append("браузер: \(error.localizedDescription)")
+            }
+        }
+        failure = notes.suffix(3).joined(separator: "\n")
     }
 }
 
@@ -436,48 +459,44 @@ struct PagePicker: View {
     }
 }
 
-struct PageBar: View {
+struct PageToolbar: ViewModifier {
     let page: Int
     let pages: Int
     let go: (Int) -> Void
     @State private var picking = false
 
-    var body: some View {
-        if pages > 1 {
-            GlassEffectContainer(spacing: 10) {
-                HStack(spacing: 10) {
-                    barButton("chevron.left.2", enabled: page > 1) { go(1) }
-                    barButton("chevron.left", enabled: page > 1) { go(page - 1) }
-                    Button { picking = true } label: {
-                        Text("\(page) / \(pages)")
-                            .font(.subheadline.weight(.semibold).monospacedDigit())
-                            .padding(.horizontal, 18)
-                            .padding(.vertical, 11)
+    func body(content: Content) -> some View {
+        content
+            .toolbarVisibility(.hidden, for: .tabBar)
+            .toolbar {
+                ToolbarItemGroup(placement: .bottomBar) {
+                    if pages > 1 {
+                        Button { go(1) } label: { Image(systemName: "chevron.left.2") }
+                            .disabled(page <= 1)
+                        Button { go(page - 1) } label: { Image(systemName: "chevron.left") }
+                            .disabled(page <= 1)
+                        Spacer()
+                        Button { picking = true } label: {
+                            Text("\(page) / \(pages)").font(.body.monospacedDigit())
+                        }
+                        Spacer()
+                        Button { go(page + 1) } label: { Image(systemName: "chevron.right") }
+                            .disabled(page >= pages)
+                        Button { go(pages) } label: { Image(systemName: "chevron.right.2") }
+                            .disabled(page >= pages)
                     }
-                    .buttonStyle(.plain)
-                    .glassEffect(.regular.interactive(), in: .capsule)
-                    barButton("chevron.right", enabled: page < pages) { go(page + 1) }
-                    barButton("chevron.right.2", enabled: page < pages) { go(pages) }
                 }
             }
-            .padding(.vertical, 6)
             .sheet(isPresented: $picking) {
                 PagePicker(page: page, pages: pages) { go($0) }
                     .presentationDetents([.height(340)])
             }
-        }
     }
+}
 
-    private func barButton(_ icon: String, enabled: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: icon)
-                .font(.subheadline.weight(.semibold))
-                .frame(width: 40, height: 40)
-        }
-        .buttonStyle(.plain)
-        .glassEffect(.regular.interactive(), in: .circle)
-        .opacity(enabled ? 1 : 0.35)
-        .disabled(!enabled)
+extension View {
+    func pageToolbar(page: Int, pages: Int, go: @escaping (Int) -> Void) -> some View {
+        modifier(PageToolbar(page: page, pages: pages, go: go))
     }
 }
 
@@ -512,9 +531,7 @@ struct ForumThreadsView: View {
         }
         .id(scrollKey)
         .refreshable { await load(page) }
-        .safeAreaInset(edge: .bottom) {
-            PageBar(page: page, pages: pages) { n in Task { await load(n) } }
-        }
+        .pageToolbar(page: page, pages: pages) { n in Task { await load(n) } }
         .navigationTitle(forum.title)
         .navigationBarTitleDisplayMode(.inline)
         .task { if items.isEmpty && error == nil && !loading { await load(1) } }
@@ -640,9 +657,7 @@ struct ThreadView: View {
             .padding(.horizontal)
         }
         .id(scrollKey)
-        .safeAreaInset(edge: .bottom) {
-            PageBar(page: page, pages: pages) { n in Task { await load(n) } }
-        }
+        .pageToolbar(page: page, pages: pages) { n in Task { await load(n) } }
         .navigationTitle(item.title)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {

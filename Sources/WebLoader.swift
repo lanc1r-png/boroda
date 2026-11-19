@@ -155,3 +155,84 @@ struct SharedWebView: UIViewRepresentable {
     func makeUIView(context: Context) -> WKWebView { WebLoader.shared.webView }
     func updateUIView(_ uiView: WKWebView, context: Context) {}
 }
+
+/// Fallback image fetcher: opens the image URL in a second WKWebView (same cookies / Cloudflare
+/// clearance as the main browser, Referer set) and reads the pixels back through a canvas.
+@MainActor
+final class ImageWebFetcher: NSObject, WKNavigationDelegate {
+    static let shared = ImageWebFetcher()
+
+    private let web: WKWebView
+    private var cont: CheckedContinuation<Void, Error>?
+    private var busy = false
+
+    override init() {
+        let cfg = WKWebViewConfiguration()
+        cfg.websiteDataStore = .default()
+        web = WKWebView(frame: CGRect(x: 0, y: 0, width: 390, height: 800), configuration: cfg)
+        super.init()
+        web.navigationDelegate = self
+    }
+
+    private static let js = """
+    (function(){
+      try {
+        if (!document.contentType || document.contentType.indexOf('image/') !== 0) return 'wait:' + document.contentType;
+        var i = document.images[0];
+        if (!i || !i.complete) return 'wait:noimg';
+        var w = i.naturalWidth, h = i.naturalHeight;
+        var s = Math.min(1, 2400 / Math.max(w, h));
+        var c = document.createElement('canvas');
+        c.width = Math.round(w * s); c.height = Math.round(h * s);
+        c.getContext('2d').drawImage(i, 0, 0, c.width, c.height);
+        return c.toDataURL('image/jpeg', 0.9);
+      } catch (e) { return 'err:' + e; }
+    })()
+    """
+
+    func fetch(_ url: URL) async throws -> UIImage {
+        while busy { try await Task.sleep(nanoseconds: 100_000_000) }
+        busy = true
+        defer { busy = false }
+
+        var req = URLRequest(url: url)
+        req.setValue(Config.base.absoluteString + "/", forHTTPHeaderField: "Referer")
+
+        let timeout = Task { @MainActor [weak self] in
+            if (try? await Task.sleep(nanoseconds: 20_000_000_000)) == nil { return }
+            self?.finish(LoadError.failed("таймаут загрузки"))
+        }
+        defer { timeout.cancel() }
+
+        try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
+            cont = c
+            web.load(req)
+        }
+
+        var last = ""
+        for _ in 0..<12 {
+            if let r = try? await web.evaluateJavaScript(Self.js), let s = r as? String {
+                if s.hasPrefix("data:image"),
+                   let comma = s.firstIndex(of: ","),
+                   let data = Data(base64Encoded: String(s[s.index(after: comma)...])),
+                   let img = UIImage(data: data) {
+                    return img
+                }
+                last = String(s.prefix(60))
+            }
+            try await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+        throw LoadError.failed("не картинка (\(last))")
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { finish(nil) }
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { finish(error) }
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { finish(error) }
+
+    private func finish(_ error: Error?) {
+        if let error, (error as NSError).code == NSURLErrorCancelled { return }
+        guard let c = cont else { return }
+        cont = nil
+        if let error { c.resume(throwing: error) } else { c.resume() }
+    }
+}
