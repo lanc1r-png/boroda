@@ -459,6 +459,7 @@ struct SearchView: View {
     @State private var resultsURL: URL?
     @State private var loadingMore = false
     @State private var moreError: String?
+    @State private var prefixTarget: PrefixTarget?
 
     var body: some View {
         NavigationStack {
@@ -475,6 +476,8 @@ struct SearchView: View {
             .navigationTitle("Поиск")
             .toolbar { ToolbarItem(placement: .topBarTrailing) { TranslateButton() } }
             .navigationDestination(for: ThreadItem.self) { ThreadView(item: $0) }
+            .navigationDestination(item: $prefixTarget) { PrefixThreadsView(target: $0) }
+            .environment(\.openPrefix, { prefixTarget = $0 })
         }
         .searchable(text: $query, prompt: "Слово или фраза")
         .searchScopes($scope) {
@@ -504,7 +507,7 @@ struct SearchView: View {
             .padding(.horizontal)
         }
         .refreshable { await run() }
-        .translateTexts(items.map(\.title) + items.map(\.meta))
+        .translateTexts(items.map(\.title) + items.compactMap(\.snippet))
     }
 
     private func run() async {
@@ -581,6 +584,7 @@ struct SectionBar: View {
 
 struct HomeView: View {
     @State private var page = 0
+    @State private var prefixTarget: PrefixTarget?
 
     var body: some View {
         NavigationStack {
@@ -597,6 +601,8 @@ struct HomeView: View {
             .toolbar { ToolbarItem(placement: .topBarTrailing) { TranslateButton() } }
             .navigationDestination(for: Forum.self) { ForumThreadsView(forum: $0) }
             .navigationDestination(for: ThreadItem.self) { ThreadView(item: $0) }
+            .navigationDestination(item: $prefixTarget) { PrefixThreadsView(target: $0) }
+            .environment(\.openPrefix, { prefixTarget = $0 })
         }
     }
 }
@@ -647,18 +653,216 @@ struct ForumsView: View {
     }
 }
 
+// MARK: - Rich result row (cover, coloured labels, highlighted snippet)
+
+struct PrefixTarget: Hashable {
+    let text: String
+    let labelURL: URL?
+    let forumURL: URL?
+}
+
+private struct OpenPrefixKey: EnvironmentKey {
+    static let defaultValue: (PrefixTarget) -> Void = { _ in }
+}
+
+extension EnvironmentValues {
+    var openPrefix: (PrefixTarget) -> Void {
+        get { self[OpenPrefixKey.self] }
+        set { self[OpenPrefixKey.self] = newValue }
+    }
+}
+
+func labelColors(_ style: String, text: String) -> (bg: Color, fg: Color) {
+    switch style {
+    case "red": return (Color(red: 0.78, green: 0.2, blue: 0.2), .white)
+    case "green", "lightGreen": return (Color(red: 0.2, green: 0.6, blue: 0.32), .white)
+    case "olive", "yellow": return (Color.yellow.opacity(0.92), .black)
+    case "blue", "royalBlue", "skyBlue": return (Color.blue, .white)
+    case "orange": return (Color.orange, .black)
+    case "purple", "violet": return (Color.purple, .white)
+    case "gray", "silver": return (Color.gray, .white)
+    case "primary", "accent": return (Color.accentColor, .white)
+    default:
+        var h: UInt32 = 5381
+        for u in text.unicodeScalars { h = h &* 33 &+ u.value }
+        return (Color(hue: Double(h % 360) / 360, saturation: 0.6, brightness: 0.55), .white)
+    }
+}
+
+struct FlowLayout: Layout {
+    var spacing: CGFloat = 6
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let maxW = proposal.width ?? .infinity
+        var x: CGFloat = 0, y: CGFloat = 0, rowH: CGFloat = 0, width: CGFloat = 0
+        for s in subviews {
+            let sz = s.sizeThatFits(.unspecified)
+            if x + sz.width > maxW, x > 0 { y += rowH + spacing; x = 0; rowH = 0 }
+            x += sz.width + spacing
+            rowH = max(rowH, sz.height)
+            width = max(width, x - spacing)
+        }
+        return CGSize(width: width, height: y + rowH)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var x = bounds.minX, y = bounds.minY, rowH: CGFloat = 0
+        for s in subviews {
+            let sz = s.sizeThatFits(.unspecified)
+            if x + sz.width > bounds.maxX, x > bounds.minX { y += rowH + spacing; x = bounds.minX; rowH = 0 }
+            s.place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(sz))
+            x += sz.width + spacing
+            rowH = max(rowH, sz.height)
+        }
+    }
+}
+
+struct LabelFlow: View {
+    let labels: [TagLabel]
+    let forumURL: URL?
+    @Environment(\.openPrefix) private var openPrefix
+
+    var body: some View {
+        FlowLayout(spacing: 6) {
+            ForEach(labels, id: \.self) { l in
+                Button {
+                    openPrefix(PrefixTarget(text: l.text, labelURL: l.url, forumURL: forumURL))
+                } label: {
+                    let c = labelColors(l.style, text: l.text)
+                    Text(l.text)
+                        .font(.caption.weight(.bold))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .foregroundStyle(c.fg)
+                        .background(c.bg, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+}
+
+struct ThumbView: View {
+    let url: URL?
+    @State private var image: UIImage?
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 10, style: .continuous).fill(.quaternary)
+            if let image {
+                Image(uiImage: image).resizable().scaledToFill()
+            }
+        }
+        .frame(width: 96, height: 72)
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .task(id: url) {
+            guard image == nil, let url else { return }
+            image = try? await ImageLoader.load(url)
+        }
+    }
+}
+
+func highlighted(_ text: String, words: [String]) -> AttributedString {
+    var a = AttributedString(text)
+    for w in words where !w.isEmpty {
+        var start = a.startIndex
+        while let r = a[start...].range(of: w, options: .caseInsensitive) {
+            a[r].inlinePresentationIntent = .stronglyEmphasized
+            start = r.upperBound
+        }
+    }
+    return a
+}
+
 struct ThreadRow: View {
     let item: ThreadItem
     private let tx = TranslationStore.shared
+
+    private var rich: Bool { item.thumb != nil || item.snippet != nil }
+
     var body: some View {
         Card {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(tx.tr(item.title)).font(.headline).multilineTextAlignment(.leading)
-                HStack {
-                    if !item.author.isEmpty { Text(item.author).font(.caption.weight(.semibold)) }
-                    Text(tx.tr(item.meta)).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+            HStack(alignment: .top, spacing: 12) {
+                if rich { ThumbView(url: item.thumb) }
+                VStack(alignment: .leading, spacing: 6) {
+                    if let labels = item.labels, !labels.isEmpty {
+                        LabelFlow(labels: labels, forumURL: item.forumURL)
+                    }
+                    Text(tx.tr(item.title))
+                        .font(.headline)
+                        .foregroundStyle(rich ? Color.accentColor : Color.primary)
+                        .multilineTextAlignment(.leading)
+                    if let sn = item.snippet, !sn.isEmpty {
+                        if let t = tx.translated(sn) {
+                            Text(t).font(.subheadline)
+                        } else {
+                            Text(highlighted(sn, words: item.highlights ?? [])).font(.subheadline)
+                        }
+                    }
+                    HStack(spacing: 6) {
+                        if !item.author.isEmpty && item.snippet == nil {
+                            Text(item.author).font(.caption.weight(.semibold))
+                        }
+                        if !item.meta.isEmpty {
+                            Text(item.meta).font(.caption).foregroundStyle(.secondary).lineLimit(3)
+                        }
+                    }
                 }
             }
+        }
+    }
+}
+
+/// Opens a forum filtered by a prefix label (resolves the prefix id from the forum's filter menu when needed).
+struct PrefixThreadsView: View {
+    let target: PrefixTarget
+    @State private var forum: Forum?
+    @State private var error: String?
+
+    var body: some View {
+        Group {
+            if let forum {
+                ForumThreadsView(forum: forum)
+            } else if let error {
+                ContentUnavailableView {
+                    Label("Не удалось открыть", systemImage: "exclamationmark.triangle")
+                } description: {
+                    Text(error)
+                }
+            } else {
+                ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .task { if forum == nil && error == nil { await resolve() } }
+    }
+
+    private func resolve() async {
+        if let u = target.labelURL {
+            forum = Forum(title: target.text, desc: "", url: u)
+            return
+        }
+        guard let f = target.forumURL else {
+            error = "У этого ярлыка нет раздела, к которому его можно привязать."
+            return
+        }
+        do {
+            let html = try await WebLoader.shared.html(f)
+            let doc = try SwiftSoup.parse(html)
+            var prefixID: String?
+            for o in try doc.select("select[name=prefix_id] option").array() {
+                let t = try o.text().trimmingCharacters(in: .whitespacesAndNewlines)
+                if t == target.text { prefixID = try o.attr("value"); break }
+            }
+            var url = f
+            if let id = prefixID, !id.isEmpty, var c = URLComponents(url: f, resolvingAgainstBaseURL: false) {
+                var qi = c.queryItems ?? []
+                qi.append(URLQueryItem(name: "prefix_id", value: id))
+                c.queryItems = qi
+                url = c.url ?? f
+            }
+            forum = Forum(title: target.text, desc: "", url: url)
+        } catch {
+            self.error = error.localizedDescription
         }
     }
 }
@@ -676,7 +880,7 @@ struct ThreadListView: View {
             .padding(.horizontal)
         }
         .refreshable { await reload() }
-        .translateTexts(items.map(\.title) + items.map(\.meta).filter { !$0.hasPrefix("Ответов") })
+        .translateTexts(items.map(\.title) + items.compactMap(\.snippet))
     }
 }
 
@@ -1042,6 +1246,7 @@ struct ThreadView: View {
 
 struct BookmarksView: View {
     private let store = BookmarkStore.shared
+    @State private var prefixTarget: PrefixTarget?
 
     var body: some View {
         NavigationStack {
@@ -1062,6 +1267,8 @@ struct BookmarksView: View {
             }
             .navigationTitle("Закладки")
             .navigationDestination(for: ThreadItem.self) { ThreadView(item: $0) }
+            .navigationDestination(item: $prefixTarget) { PrefixThreadsView(target: $0) }
+            .environment(\.openPrefix, { prefixTarget = $0 })
         }
     }
 }

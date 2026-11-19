@@ -8,12 +8,25 @@ struct Forum: Identifiable, Hashable {
     let url: URL
 }
 
+/// A coloured prefix label ("Request", "TikTok"…). `url` is the forum filter link when the page provides one.
+struct TagLabel: Hashable, Codable {
+    let text: String
+    let style: String
+    var url: URL? = nil
+}
+
 struct ThreadItem: Identifiable, Hashable, Codable {
     var id: String { url.absoluteString }
     let title: String
     let author: String
     let meta: String
     let url: URL
+    var labels: [TagLabel]? = nil
+    var thumb: URL? = nil
+    var snippet: String? = nil
+    var highlights: [String]? = nil
+    var forumURL: URL? = nil
+    var forumName: String? = nil
 }
 
 struct LinkCard: Identifiable {
@@ -80,6 +93,37 @@ enum Parser {
         return nums.max() ?? 1
     }
 
+    /// Prefix labels inside a row (colour comes from the label--xxx class).
+    static func labels(in root: Element, selector: String) -> [TagLabel] {
+        var out: [TagLabel] = []
+        for lab in ((try? root.select(selector).array()) ?? []) {
+            let text = ((try? lab.text()) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if text.isEmpty || out.contains(where: { $0.text == text }) { continue }
+            let cls = ((try? lab.className()) ?? "").split(separator: " ").map(String.init)
+            let style = cls.first(where: { $0.hasPrefix("label--") })?
+                .replacingOccurrences(of: "label--", with: "") ?? ""
+            var url: URL?
+            if let p = lab.parent(), p.tagName() == "a",
+               let href = try? p.attr("href"), href.contains("prefix_id") {
+                url = abs(href)
+            }
+            out.append(TagLabel(text: text, style: style, url: url))
+        }
+        return out
+    }
+
+    /// Cover / icon image of a list row.
+    static func thumb(in root: Element) -> URL? {
+        for sel in [".contentRow-figure img", ".structItem-iconContainer img", ".structItem-cell--icon img"] {
+            for img in ((try? root.select(sel).array()) ?? []) {
+                for key in ["data-src", "src"] {
+                    if let v = try? img.attr(key), !v.isEmpty, !v.hasPrefix("data:"), let u = abs(v) { return u }
+                }
+            }
+        }
+        return nil
+    }
+
     static func forums(_ html: String) throws -> [Forum] {
         let doc = try SwiftSoup.parse(html)
         var out: [Forum] = []
@@ -101,7 +145,9 @@ enum Parser {
             guard let url = try abs(a.attr("href")) else { continue }
             let author = try it.attr("data-author")
             let replies = (try it.select(".structItem-cell--meta dl dd").first()?.text()) ?? "0"
-            out.append(ThreadItem(title: try a.text(), author: author, meta: "Ответов: \(replies)", url: url))
+            out.append(ThreadItem(title: try a.text(), author: author, meta: "Ответов: \(replies)", url: url,
+                                  labels: labels(in: it, selector: ".structItem-title .label"),
+                                  thumb: thumb(in: it)))
         }
         if out.isEmpty { throw noResults(doc, what: "Тем") }
         return (out, pageCount(doc))
@@ -113,9 +159,31 @@ enum Parser {
         for r in try doc.select(".contentRow").array() {
             guard let a = try r.select(".contentRow-title a").first() else { continue }
             guard let url = try abs(a.attr("href")) else { continue }
-            let snippet = (try r.select(".contentRow-snippet").first()?.text()) ?? ""
+            let snippetEl = try r.select(".contentRow-snippet").first()
+            let snippet = (try snippetEl?.text()) ?? ""
+            var words: [String] = []
+            if let sn = snippetEl {
+                for h in ((try? sn.select(".textHighlight, b, strong").array()) ?? []) {
+                    if let t = try? h.text(), !t.isEmpty { words.append(t) }
+                }
+            }
             let author = (try r.select(".username").first()?.text()) ?? ""
-            out.append(ThreadItem(title: try a.text(), author: author, meta: snippet, url: url))
+            let labs = labels(in: r, selector: ".contentRow-title .label")
+            var title = try a.text()
+            for l in labs where title.hasPrefix(l.text) {
+                title = String(title.dropFirst(l.text.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            var parts = ((try? r.select(".contentRow-minor li").array()) ?? [])
+                .compactMap { try? $0.text() }.filter { !$0.isEmpty }
+            if let f = parts.first, f == author { parts.removeFirst() }
+            let forumLink = try? r.select(".contentRow-minor a[href*='/forums/']").first()
+            let forumURL = forumLink.flatMap { try? $0.attr("href") }.flatMap { abs($0) }
+            let forumName = forumLink.flatMap { try? $0.text() }
+            out.append(ThreadItem(title: title, author: author,
+                                  meta: parts.joined(separator: " · "), url: url,
+                                  labels: labs, thumb: thumb(in: r),
+                                  snippet: snippet, highlights: words,
+                                  forumURL: forumURL, forumName: forumName))
         }
         if out.isEmpty { throw noResults(doc, what: "Ничего") }
         return out
