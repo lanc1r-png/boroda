@@ -6,6 +6,14 @@ struct Forum: Identifiable, Hashable {
     let title: String
     let desc: String
     let url: URL
+    var category = ""
+    var threadsCount: String? = nil
+    var messagesCount: String? = nil
+    var lastTitle: String? = nil
+    var lastURL: URL? = nil
+    var lastAuthor: String? = nil
+    var lastDate: String? = nil
+    var lastAvatar: URL? = nil
 }
 
 /// A coloured prefix label ("Request", "TikTok"…). `url` is the forum filter link when the page provides one.
@@ -124,14 +132,51 @@ enum Parser {
         return nil
     }
 
+    static func forumNode(_ n: Element, category: String) -> Forum? {
+        guard let a = try? n.select(".node-title a").first(),
+              let href = try? a.attr("href"), let url = abs(href) else { return nil }
+        let title = (try? a.text()) ?? ""
+        let desc = (try? n.select(".node-description").first()?.text()) ?? ""
+
+        var threads: String?
+        var messages: String?
+        for dl in ((try? n.select(".node-stats dl").array()) ?? []) {
+            let k = ((try? dl.select("dt").first()?.text()) ?? "").lowercased()
+            let v = (try? dl.select("dd").first()?.text()) ?? ""
+            if k.contains("thread") { threads = v } else if k.contains("message") || k.contains("post") { messages = v }
+        }
+
+        let last = try? n.select(".node-extra-title").first()
+        let lastTitle = last.flatMap { try? $0.text() }
+        let lastURL = last.flatMap { try? $0.attr("href") }.flatMap { abs($0) }
+        let lastDate = (try? n.select(".node-extra-date").first()?.text()) ?? nil
+        let lastAuthor = (try? n.select(".node-extra-user").first()?.text()) ?? nil
+        var avatar: URL?
+        if let img = try? n.select(".node-extra-icon img").first() {
+            for key in ["data-src", "src"] {
+                if let v = try? img.attr(key), !v.isEmpty, !v.hasPrefix("data:"), let u = abs(v) { avatar = u; break }
+            }
+        }
+        return Forum(title: title, desc: desc, url: url, category: category,
+                     threadsCount: threads, messagesCount: messages,
+                     lastTitle: (lastTitle ?? "").isEmpty ? nil : lastTitle,
+                     lastURL: lastURL, lastAuthor: lastAuthor, lastDate: lastDate, lastAvatar: avatar)
+    }
+
     static func forums(_ html: String) throws -> [Forum] {
         let doc = try SwiftSoup.parse(html)
         var out: [Forum] = []
-        for n in try doc.select(".node--forum").array() {
-            guard let a = try n.select(".node-title a").first() else { continue }
-            guard let url = try abs(a.attr("href")) else { continue }
-            let desc = (try n.select(".node-description").first()?.text()) ?? ""
-            out.append(Forum(title: try a.text(), desc: desc, url: url))
+        func add(_ f: Forum?) {
+            if let f, !out.contains(where: { $0.url == f.url }) { out.append(f) }
+        }
+        let blocks = (try? doc.select(".block--category").array()) ?? []
+        if blocks.isEmpty {
+            for n in try doc.select(".node--forum").array() { add(forumNode(n, category: "")) }
+        } else {
+            for b in blocks {
+                let cat = ((try? b.select(".block-header").first()?.text()) ?? "") ?? ""
+                for n in ((try? b.select(".node--forum").array()) ?? []) { add(forumNode(n, category: cat)) }
+            }
         }
         if out.isEmpty { throw noResults(doc, what: "Форумов") }
         return out

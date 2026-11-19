@@ -617,32 +617,151 @@ struct Card<Content: View>: View {
     }
 }
 
+struct ForumIcon: View {
+    let title: String
+
+    var body: some View {
+        var h: UInt32 = 5381
+        for u in title.unicodeScalars { h = h &* 33 &+ u.value }
+        let hue = Double(h % 360) / 360
+        return Image(systemName: "bubble.left.and.bubble.right.fill")
+            .font(.title3)
+            .foregroundStyle(.white)
+            .frame(width: 46, height: 46)
+            .background(
+                LinearGradient(colors: [Color(hue: hue, saturation: 0.55, brightness: 0.85),
+                                        Color(hue: hue, saturation: 0.75, brightness: 0.55)],
+                               startPoint: .topLeading, endPoint: .bottomTrailing),
+                in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+    }
+}
+
+struct AvatarView: View {
+    let url: URL?
+    @State private var image: UIImage?
+
+    var body: some View {
+        ZStack {
+            Circle().fill(.quaternary)
+            if let image {
+                Image(uiImage: image).resizable().scaledToFill()
+            } else {
+                Image(systemName: "person.fill").font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .frame(width: 30, height: 30)
+        .clipShape(Circle())
+        .task(id: url) {
+            guard image == nil, let url else { return }
+            image = try? await ImageLoader.load(url)
+        }
+    }
+}
+
+struct ForumCard: View {
+    let forum: Forum
+    private let tx = TranslationStore.shared
+
+    var body: some View {
+        VStack(spacing: 0) {
+            NavigationLink(value: forum) {
+                HStack(alignment: .top, spacing: 12) {
+                    ForumIcon(title: forum.title)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(tx.tr(forum.title)).font(.headline).multilineTextAlignment(.leading)
+                        if !forum.desc.isEmpty {
+                            Text(tx.tr(forum.desc))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .multilineTextAlignment(.leading)
+                                .lineLimit(2)
+                        }
+                        HStack(spacing: 10) {
+                            if let t = forum.threadsCount {
+                                Label(t, systemImage: "text.bubble")
+                            }
+                            if let m = forum.messagesCount {
+                                Label(m, systemImage: "bubble.left")
+                            }
+                        }
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 0)
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.tertiary)
+                        .padding(.top, 4)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if let t = forum.lastTitle, let u = forum.lastURL {
+                Divider().padding(.vertical, 10)
+                NavigationLink(value: ThreadItem(title: t, author: forum.lastAuthor ?? "", meta: "", url: u)) {
+                    HStack(spacing: 8) {
+                        AvatarView(url: forum.lastAvatar)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(tx.tr(t)).font(.footnote.weight(.semibold)).lineLimit(1)
+                            Text([forum.lastAuthor, forum.lastDate].compactMap { $0 }.joined(separator: " · "))
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(14)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+    }
+}
+
 struct ForumsView: View {
     @State private var state: LoadState<[Forum]> = .idle
     private let tx = TranslationStore.shared
 
+    private func groups(_ forums: [Forum]) -> [(name: String, items: [Forum])] {
+        var out: [(name: String, items: [Forum])] = []
+        for f in forums {
+            if let i = out.firstIndex(where: { $0.name == f.category }) {
+                out[i].items.append(f)
+            } else {
+                out.append((name: f.category, items: [f]))
+            }
+        }
+        return out
+    }
+
     var body: some View {
         StateView(state: state, retry: load) { forums in
             ScrollView {
-                LazyVStack(spacing: 10) {
-                    ForEach(forums) { f in
-                        NavigationLink(value: f) {
-                            Card {
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(tx.tr(f.title)).font(.headline)
-                                    if !f.desc.isEmpty {
-                                        Text(tx.tr(f.desc)).font(.caption).foregroundStyle(.secondary).lineLimit(2)
-                                    }
-                                }
-                            }
+                LazyVStack(spacing: 12) {
+                    ForEach(Array(groups(forums).enumerated()), id: \.offset) { _, g in
+                        if !g.name.isEmpty {
+                            Text(tx.tr(g.name))
+                                .font(.footnote.weight(.bold))
+                                .textCase(.uppercase)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 7)
+                                .glassEffect(.regular, in: .capsule)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.top, 8)
                         }
-                        .buttonStyle(.plain)
+                        ForEach(g.items) { f in
+                            ForumCard(forum: f)
+                        }
                     }
                 }
                 .padding(.horizontal)
+                .padding(.bottom, 24)
             }
             .refreshable { await load() }
-            .translateTexts(forums.flatMap { [$0.title, $0.desc] })
+            .translateTexts(forums.flatMap { [$0.title, $0.desc, $0.category, $0.lastTitle ?? ""] })
         }
         .task { if case .idle = state { await load() } }
     }
