@@ -120,13 +120,40 @@ enum Parser {
         return out
     }
 
+    /// Raw HTML of the first row of each kind, so it can be copied from the Profile screen for debugging.
+    static var samples: [String: String] = [:]
+
+    static func sample(_ key: String, _ el: Element?, limit: Int = 6000) {
+        guard let el, let html = try? el.outerHtml() else { return }
+        samples[key] = String(html.prefix(limit))
+    }
+
+    /// First usable image URL inside an element: <img> (data-src/src/srcset) or CSS url(...).
+    static func firstImageURL(in el: Element) -> URL? {
+        for img in ((try? el.select("img").array()) ?? []) {
+            for key in ["data-src", "data-url", "data-original", "src"] {
+                if let v = try? img.attr(key), !v.isEmpty, !v.hasPrefix("data:"), let u = abs(v) { return u }
+            }
+            if let ss = try? img.attr("srcset"),
+               let first = ss.split(separator: ",").first?.split(separator: " ").first,
+               let u = abs(String(first)) { return u }
+        }
+        let html = (try? el.outerHtml()) ?? ""
+        if let re = try? NSRegularExpression(pattern: #"url\(\s*(?:&quot;|&#0?39;|['"])?([^)'"&\s]+)"#),
+           let m = re.firstMatch(in: html, range: NSRange(html.startIndex..., in: html)),
+           m.numberOfRanges > 1, let r = Range(m.range(at: 1), in: html) {
+            let v = String(html[r])
+            if !v.hasPrefix("data:"), let u = abs(v) { return u }
+        }
+        return nil
+    }
+
     /// Cover / icon image of a list row.
     static func thumb(in root: Element) -> URL? {
-        for sel in [".contentRow-figure img", ".structItem-iconContainer img", ".structItem-cell--icon img"] {
-            for img in ((try? root.select(sel).array()) ?? []) {
-                for key in ["data-src", "src"] {
-                    if let v = try? img.attr(key), !v.isEmpty, !v.hasPrefix("data:"), let u = abs(v) { return u }
-                }
+        for sel in [".contentRow-figure", ".structItem-cell--icon", ".structItem-cell--thumb",
+                    ".structItem-thumb", "[class*=thumb]", "[class*=cover]"] {
+            for c in ((try? root.select(sel).array()) ?? []) {
+                if let u = firstImageURL(in: c) { return u }
             }
         }
         return nil
@@ -178,6 +205,7 @@ enum Parser {
                 for n in ((try? b.select(".node--forum").array()) ?? []) { add(forumNode(n, category: cat)) }
             }
         }
+        sample("forum", (try? doc.select(".node--forum").first()) ?? nil)
         if out.isEmpty { throw noResults(doc, what: "Форумов") }
         return out
     }
@@ -188,6 +216,7 @@ enum Parser {
         for it in try doc.select(".structItem--thread").array() {
             guard let a = try it.select(".structItem-title a[href*='/threads/']").first() else { continue }
             guard let url = try abs(a.attr("href")) else { continue }
+            if out.isEmpty { sample("thread", it) }
             let author = try it.attr("data-author")
             let replies = (try it.select(".structItem-cell--meta dl dd").first()?.text()) ?? "0"
             out.append(ThreadItem(title: try a.text(), author: author, meta: "Ответов: \(replies)", url: url,
@@ -218,6 +247,9 @@ enum Parser {
             for l in labs where title.hasPrefix(l.text) {
                 title = String(title.dropFirst(l.text.count)).trimmingCharacters(in: .whitespacesAndNewlines)
             }
+            let blockRow: Element? = r.parent().flatMap { $0.hasClass("block-row") ? $0 : nil }
+            let scope = blockRow ?? r
+            if out.isEmpty { sample("search", blockRow ?? r) }
             var parts = ((try? r.select(".contentRow-minor li").array()) ?? [])
                 .compactMap { try? $0.text() }.filter { !$0.isEmpty }
             if let f = parts.first, f == author { parts.removeFirst() }
@@ -226,7 +258,7 @@ enum Parser {
             let forumName = forumLink.flatMap { try? $0.text() }
             out.append(ThreadItem(title: title, author: author,
                                   meta: parts.joined(separator: " · "), url: url,
-                                  labels: labs, thumb: thumb(in: r),
+                                  labels: labs, thumb: thumb(in: scope),
                                   snippet: snippet, highlights: words,
                                   forumURL: forumURL, forumName: forumName))
         }
@@ -439,6 +471,7 @@ enum Parser {
             r.flush()
             out.append(Post(postID: postID, author: author, date: date, parts: r.parts, images: images, cards: cards))
         }
+        sample("post", (try? doc.select("article.message--post").first()) ?? nil, limit: 9000)
         if out.isEmpty { throw noResults(doc, what: "Сообщений") }
         return (out, pageCount(doc))
     }

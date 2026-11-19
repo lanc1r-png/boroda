@@ -257,6 +257,20 @@ extension ImageLoader {
     }
 }
 
+extension ImageLoader {
+    /// Normal download first; if the site refuses, let the in-app browser fetch it.
+    static func loadWithFallback(_ url: URL) async throws -> UIImage {
+        do {
+            return try await load(url)
+        } catch {
+            if error is CancellationError || (error as? URLError)?.code == .cancelled { throw error }
+            let img = try await ImageWebFetcher.shared.fetch(url)
+            cache.setObject(img, forKey: url as NSURL)
+            return img
+        }
+    }
+}
+
 struct ViewerImage: Identifiable {
     let id = UUID()
     let image: UIImage
@@ -653,7 +667,7 @@ struct AvatarView: View {
         .clipShape(Circle())
         .task(id: url) {
             guard image == nil, let url else { return }
-            image = try? await ImageLoader.load(url)
+            image = try? await ImageLoader.loadWithFallback(url)
         }
     }
 }
@@ -864,19 +878,29 @@ struct LabelFlow: View {
 struct ThumbView: View {
     let url: URL?
     @State private var image: UIImage?
+    @State private var failed = false
 
     var body: some View {
         ZStack {
             RoundedRectangle(cornerRadius: 10, style: .continuous).fill(.quaternary)
             if let image {
                 Image(uiImage: image).resizable().scaledToFill()
+            } else if failed {
+                Image(systemName: "photo").foregroundStyle(.secondary)
+            } else {
+                ProgressView().controlSize(.small)
             }
         }
         .frame(width: 96, height: 72)
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         .task(id: url) {
             guard image == nil, let url else { return }
-            image = try? await ImageLoader.load(url)
+            do {
+                image = try await ImageLoader.loadWithFallback(url)
+                failed = false
+            } catch {
+                if !(error is CancellationError) && (error as? URLError)?.code != .cancelled { failed = true }
+            }
         }
     }
 }
@@ -902,7 +926,7 @@ struct ThreadRow: View {
     var body: some View {
         Card {
             HStack(alignment: .top, spacing: 12) {
-                if rich { ThumbView(url: item.thumb) }
+                if item.thumb != nil { ThumbView(url: item.thumb) }
                 VStack(alignment: .leading, spacing: 6) {
                     if let labels = item.labels, !labels.isEmpty {
                         LabelFlow(labels: labels, forumURL: item.forumURL)
@@ -1396,6 +1420,7 @@ struct BookmarksView: View {
 
 struct ProfileView: View {
     @State private var showBrowser = false
+    @State private var copied: String?
     private let auth = AuthState.shared
 
     var body: some View {
@@ -1424,6 +1449,33 @@ struct ProfileView: View {
                     Button("Обновить статус", systemImage: "arrow.clockwise") {
                         Task { await auth.refresh() }
                     }
+                }
+                Section {
+                    ForEach([("search", "Строка результата поиска"),
+                             ("forum", "Строка форума (главная)"),
+                             ("thread", "Строка темы (список раздела)"),
+                             ("post", "Сообщение в теме")], id: \.0) { key, title in
+                        Button {
+                            if let s = Parser.samples[key] {
+                                UIPasteboard.general.string = s
+                                copied = key
+                            }
+                        } label: {
+                            HStack {
+                                Label(title, systemImage: "doc.on.clipboard")
+                                Spacer()
+                                if copied == key {
+                                    Text("Скопировано").font(.caption).foregroundStyle(.green)
+                                } else if Parser.samples[key] == nil {
+                                    Text("нет данных").font(.caption).foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                    }
+                } header: {
+                    Text("Диагностика")
+                } footer: {
+                    Text("Сначала откройте нужный экран, потом нажмите кнопку и вставьте текст в чат с ассистентом.")
                 }
                 Section("О приложении") {
                     Text("Неофициальный клиент. Страницы загружаются через встроенный браузер и разбираются нативно.")
