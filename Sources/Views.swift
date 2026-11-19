@@ -2,7 +2,6 @@ import SwiftUI
 import Observation
 import Translation
 import SwiftSoup
-import Photos
 
 // MARK: - Helpers
 
@@ -208,7 +207,6 @@ extension View {
 
 enum ImageLoader {
     static let cache = NSCache<NSURL, UIImage>()
-    static let dataCache = NSCache<NSURL, NSData>()
 
     /// Loads with the same cookies / User-Agent / Referer as the in-app browser,
     /// so hotlink protection and login-only attachments work.
@@ -231,19 +229,8 @@ enum ImageLoader {
             throw LoadError.failed("\(host): HTTP \(code) \(ct) \(data.count / 1024) KB")
         }
         let img = await raw.byPreparingForDisplay() ?? raw
-        dataCache.setObject(data as NSData, forKey: url as NSURL)
         cache.setObject(img, forKey: url as NSURL)
         return img
-    }
-
-    /// Decoded image plus the exact original file bytes.
-    static func loadFull(_ url: URL) async throws -> (image: UIImage, data: Data) {
-        let img = try await load(url)
-        if let d = dataCache.object(forKey: url as NSURL) { return (img, d as Data) }
-        cache.removeObject(forKey: url as NSURL)
-        let img2 = try await load(url)
-        guard let d = dataCache.object(forKey: url as NSURL) else { throw LoadError.failed("нет данных") }
-        return (img2, d as Data)
     }
 }
 
@@ -287,75 +274,32 @@ extension ImageLoader {
 struct ViewerImage: Identifiable {
     let id = UUID()
     let image: UIImage
-    let ref: ImageRef
 }
 
 final class PhotoSaver: NSObject, ObservableObject {
     @Published var status: String?
 
-    /// Saves the original file bytes when available (no re-encoding), otherwise the decoded image.
-    func save(image: UIImage, data: Data?) {
-        guard let data else {
-            saveImage(image)
-            return
-        }
-        PHPhotoLibrary.requestAuthorization(for: .addOnly) { [weak self] auth in
-            guard auth == .authorized || auth == .limited else {
-                DispatchQueue.main.async { self?.flash("Нет доступа к «Фото»: разрешите в Настройках") }
-                return
-            }
-            PHPhotoLibrary.shared().performChanges({
-                PHAssetCreationRequest.forAsset().addResource(with: .photo, data: data, options: nil)
-            }) { ok, _ in
-                DispatchQueue.main.async {
-                    if ok { self?.flash("Оригинал сохранён в «Фото»") } else { self?.saveImage(image) }
-                }
-            }
-        }
-    }
-
-    private func saveImage(_ image: UIImage) {
+    func save(_ image: UIImage) {
         UIImageWriteToSavedPhotosAlbum(image, self, #selector(done(_:didFinishSavingWithError:contextInfo:)), nil)
     }
 
     @objc private func done(_ image: UIImage, didFinishSavingWithError error: Error?, contextInfo: UnsafeRawPointer) {
-        flash(error == nil ? "Сохранено в «Фото»" : "Не удалось сохранить")
-    }
-
-    private func flash(_ text: String) {
-        status = text
+        status = error == nil ? "Сохранено в «Фото»" : "Не удалось сохранить: \(error!.localizedDescription)"
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in self?.status = nil }
     }
 }
 
 struct ImageViewer: View {
-    let ref: ImageRef
+    let image: UIImage
     @Environment(\.dismiss) private var dismiss
-    @State private var current: UIImage
-    @State private var bestData: Data?
-    @State private var shareURL: URL?
-    @State private var searching = true
     @State private var scale: CGFloat = 1
     @State private var lastScale: CGFloat = 1
     @StateObject private var saver = PhotoSaver()
 
-    init(image: UIImage, ref: ImageRef) {
-        self.ref = ref
-        _current = State(initialValue: image)
-    }
-
-    private var resolution: String {
-        var s = "\(Int(current.size.width * current.scale))×\(Int(current.size.height * current.scale))"
-        if let d = bestData {
-            s += " · " + ByteCountFormatter.string(fromByteCount: Int64(d.count), countStyle: .file)
-        }
-        return s
-    }
-
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            Image(uiImage: current)
+            Image(uiImage: image)
                 .resizable()
                 .interpolation(.high)
                 .antialiased(true)
@@ -372,13 +316,10 @@ struct ImageViewer: View {
 
             VStack {
                 HStack {
-                    HStack(spacing: 8) {
-                        if searching { ProgressView().controlSize(.small) }
-                        Text(searching ? "Ищу оригинал… " + resolution : resolution)
-                            .font(.caption.monospacedDigit())
-                    }
-                    .padding(.horizontal, 12).padding(.vertical, 8)
-                    .glassEffect(.regular, in: .capsule)
+                    Text("\(Int(image.size.width * image.scale))×\(Int(image.size.height * image.scale))")
+                        .font(.caption.monospacedDigit())
+                        .padding(.horizontal, 12).padding(.vertical, 8)
+                        .glassEffect(.regular, in: .capsule)
                     Spacer()
                     Button { dismiss() } label: {
                         Image(systemName: "xmark").font(.headline).padding(14)
@@ -393,78 +334,31 @@ struct ImageViewer: View {
                 }
                 GlassEffectContainer(spacing: 12) {
                     HStack(spacing: 12) {
-                        Button { saver.save(image: current, data: bestData) } label: {
+                        Button { saver.save(image) } label: {
                             Label("Сохранить", systemImage: "arrow.down.to.line")
                                 .padding(.horizontal, 14).padding(.vertical, 10)
                         }
                         .buttonStyle(.plain)
                         .glassEffect(.regular.interactive(), in: .capsule)
 
-                        if let shareURL {
-                            ShareLink(item: shareURL) {
-                                Label("Поделиться", systemImage: "square.and.arrow.up")
-                                    .padding(.horizontal, 14).padding(.vertical, 10)
-                            }
-                            .buttonStyle(.plain)
-                            .glassEffect(.regular.interactive(), in: .capsule)
-                        } else {
-                            ShareLink(item: Image(uiImage: current),
-                                      preview: SharePreview("Изображение", image: Image(uiImage: current))) {
-                                Label("Поделиться", systemImage: "square.and.arrow.up")
-                                    .padding(.horizontal, 14).padding(.vertical, 10)
-                            }
-                            .buttonStyle(.plain)
-                            .glassEffect(.regular.interactive(), in: .capsule)
+                        ShareLink(item: Image(uiImage: image),
+                                  preview: SharePreview("Изображение", image: Image(uiImage: image))) {
+                            Label("Поделиться", systemImage: "square.and.arrow.up")
+                                .padding(.horizontal, 14).padding(.vertical, 10)
                         }
+                        .buttonStyle(.plain)
+                        .glassEffect(.regular.interactive(), in: .capsule)
                     }
                 }
                 .padding(.bottom, 24)
             }
         }
-        .task { await findBest() }
-    }
-
-    /// Tries every known address of this picture (and the host page's og:image) and keeps the largest one.
-    private func findBest() async {
-        defer { searching = false }
-        var urls = ref.candidates
-        for pg in ref.pages.prefix(2) {
-            if let u = await ImageLoader.resolvePage(pg), !urls.contains(u) { urls.insert(u, at: 0) }
-        }
-        var bestPixels = current.size.width * current.scale * current.size.height * current.scale
-        for u in urls {
-            if Task.isCancelled { return }
-            guard let full = try? await ImageLoader.loadFull(u) else { continue }
-            let px = full.image.size.width * full.image.scale * full.image.size.height * full.image.scale
-            if px >= bestPixels {
-                bestPixels = px
-                current = full.image
-                bestData = full.data
-                prepareShare(full.data, source: u)
-            }
-        }
-    }
-
-    private func prepareShare(_ data: Data, source: URL) {
-        var name = source.deletingPathExtension().lastPathComponent.filter { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
-        if name.isEmpty || name.count > 60 { name = "image" }
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(name).\(Self.fileExtension(data))")
-        if (try? data.write(to: url)) != nil { shareURL = url }
-    }
-
-    private static func fileExtension(_ d: Data) -> String {
-        let b = [UInt8](d.prefix(12))
-        if b.starts(with: [0xFF, 0xD8]) { return "jpg" }
-        if b.starts(with: [0x89, 0x50, 0x4E, 0x47]) { return "png" }
-        if b.starts(with: [0x47, 0x49, 0x46]) { return "gif" }
-        if b.count >= 12, Array(b[0..<4]) == [0x52, 0x49, 0x46, 0x46], Array(b[8..<12]) == [0x57, 0x45, 0x42, 0x50] { return "webp" }
-        return "jpg"
     }
 }
 
 struct RemoteImage: View {
     let ref: ImageRef
-    let onTap: (UIImage, ImageRef) -> Void
+    let onTap: (UIImage) -> Void
     @State private var image: UIImage?
     @State private var failure: String?
 
@@ -478,7 +372,7 @@ struct RemoteImage: View {
                     .scaledToFit()
                     .frame(maxWidth: .infinity)
                     .clipShape(RoundedRectangle(cornerRadius: 12))
-                    .onTapGesture { onTap(image, ref) }
+                    .onTapGesture { onTap(image) }
             } else if let failure {
                 VStack(alignment: .leading, spacing: 6) {
                     Label("Не удалось загрузить:\n\(failure)", systemImage: "photo")
@@ -1321,7 +1215,7 @@ struct QuoteView: View {
 struct PostView: View {
     let post: Post
     var highlight = false
-    let onImage: (UIImage, ImageRef) -> Void
+    let onImage: (UIImage) -> Void
     private let tx = TranslationStore.shared
 
     var body: some View {
@@ -1409,7 +1303,7 @@ struct ThreadView: View {
                 LazyVStack(spacing: 10) {
                     ForEach(posts) { p in
                         PostView(post: p, highlight: p.postID == highlightID) {
-                            viewer = ViewerImage(image: $0, ref: $1)
+                            viewer = ViewerImage(image: $0)
                         }
                     }
                     if loading {
@@ -1449,7 +1343,7 @@ struct ThreadView: View {
                 }
             }
         }
-        .fullScreenCover(item: $viewer) { ImageViewer(image: $0.image, ref: $0.ref) }
+        .fullScreenCover(item: $viewer) { ImageViewer(image: $0.image) }
         .task { if posts.isEmpty && error == nil && !loading { await load(1) } }
     }
 
