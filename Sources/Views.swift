@@ -217,7 +217,7 @@ enum ImageLoader {
         req.setValue(Config.base.absoluteString + "/", forHTTPHeaderField: "Referer")
         let ua = await WebLoader.shared.userAgent
         if !ua.isEmpty { req.setValue(ua, forHTTPHeaderField: "User-Agent") }
-        req.setValue("image/avif,image/webp,image/apng,image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
+        req.setValue("image/jpeg,image/png,image/gif,image/*;q=0.6,*/*;q=0.5", forHTTPHeaderField: "Accept")
         let (data, resp) = try await URLSession.shared.data(for: req)
         let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
         let ct = (resp as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type") ?? "?"
@@ -301,6 +301,8 @@ struct ImageViewer: View {
             Color.black.ignoresSafeArea()
             Image(uiImage: image)
                 .resizable()
+                .interpolation(.high)
+                .antialiased(true)
                 .scaledToFit()
                 .scaleEffect(scale)
                 .gesture(
@@ -314,6 +316,10 @@ struct ImageViewer: View {
 
             VStack {
                 HStack {
+                    Text("\(Int(image.size.width * image.scale))×\(Int(image.size.height * image.scale))")
+                        .font(.caption.monospacedDigit())
+                        .padding(.horizontal, 12).padding(.vertical, 8)
+                        .glassEffect(.regular, in: .capsule)
                     Spacer()
                     Button { dismiss() } label: {
                         Image(systemName: "xmark").font(.headline).padding(14)
@@ -361,6 +367,8 @@ struct RemoteImage: View {
             if let image {
                 Image(uiImage: image)
                     .resizable()
+                    .interpolation(.high)
+                    .antialiased(true)
                     .scaledToFit()
                     .frame(maxWidth: .infinity)
                     .clipShape(RoundedRectangle(cornerRadius: 12))
@@ -403,19 +411,19 @@ struct RemoteImage: View {
             do {
                 let img = try await ImageLoader.load(u)
                 if best == nil || pixels(img) > pixels(best!) { best = img }
-                if pixels(img) >= 1000 { break }
+                if pixels(img) >= 1500 { break }
             } catch {
                 if isCancel(error) { return }   // view scrolled away: retry on reappear
                 notes.append(error.localizedDescription)
             }
         }
         // Thumbnail wrapped in a link to an image-host page: take the page's og:image (full size)
-        if best == nil || pixels(best!) < 1000 {
+        if best == nil || pixels(best!) < 1500 {
             for pg in ref.pages.prefix(2) {
                 guard let u = await ImageLoader.resolvePage(pg),
                       let img = try? await ImageLoader.load(u) else { continue }
                 if best == nil || pixels(img) > pixels(best!) { best = img }
-                if pixels(img) >= 1000 { break }
+                if pixels(img) >= 1500 { break }
             }
         }
         if let best {
@@ -658,7 +666,7 @@ struct AvatarView: View {
         ZStack {
             Circle().fill(.quaternary)
             if let image {
-                Image(uiImage: image).resizable().scaledToFill()
+                Image(uiImage: image).resizable().interpolation(.high).scaledToFill()
             } else {
                 Image(systemName: "person.fill").font(.caption).foregroundStyle(.secondary)
             }
@@ -884,7 +892,7 @@ struct ThumbView: View {
         ZStack {
             RoundedRectangle(cornerRadius: 10, style: .continuous).fill(.quaternary)
             if let image {
-                Image(uiImage: image).resizable().scaledToFill()
+                Image(uiImage: image).resizable().interpolation(.high).scaledToFill()
             } else if failed {
                 Image(systemName: "photo").foregroundStyle(.secondary)
             } else {
