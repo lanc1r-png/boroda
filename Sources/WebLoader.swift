@@ -41,8 +41,8 @@ final class WebLoader: NSObject, WKNavigationDelegate {
         return try await waitReady()
     }
 
-    /// Title-only search through the site's own search form.
-    func search(_ query: String) async throws -> String {
+    /// Search through the site's own search form (whole posts, or titles only).
+    func search(_ query: String, titleOnly: Bool) async throws -> String {
         try await lock()
         defer { busy = false }
         try await load(Config.searchURL)
@@ -56,7 +56,7 @@ final class WebLoader: NSObject, WKNavigationDelegate {
           if(!k) return "noform";
           k.value=\(q);
           var t=f.querySelector("input[name='c[title_only]']");
-          if(t) t.checked=true;
+          if(t) t.checked=\(titleOnly);
           f.submit();
           return "ok";
         })()

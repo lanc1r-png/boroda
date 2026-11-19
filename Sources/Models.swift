@@ -35,7 +35,8 @@ struct ImageRef: Identifiable {
 }
 
 struct Post: Identifiable {
-    let id = UUID()
+    let postID: String
+    var id: String { postID }
     let author: String
     let date: String
     let parts: [PostPart]
@@ -217,6 +218,25 @@ enum Parser {
         return [".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", "/attachments/"].contains { l.contains($0) }
     }
 
+    static func searchResults(_ html: String) throws -> (items: [ThreadItem], pages: Int) {
+        let items = try latest(html)
+        let doc = try SwiftSoup.parse(html)
+        return (items, pageCount(doc))
+    }
+
+    /// Extracts a post id from /posts/123/, /threads/x.1/post-123 or #post-123.
+    static func postID(from url: URL) -> String? {
+        let s = url.absoluteString
+        for pattern in [#"/posts/(\d+)"#, #"post-(\d+)"#] {
+            if let re = try? NSRegularExpression(pattern: pattern),
+               let m = re.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)),
+               m.numberOfRanges > 1, let r = Range(m.range(at: 1), in: s) {
+                return String(s[r])
+            }
+        }
+        return nil
+    }
+
     static func posts(_ html: String) throws -> (posts: [Post], pages: Int) {
         let doc = try SwiftSoup.parse(html)
         var out: [Post] = []
@@ -224,6 +244,8 @@ enum Parser {
             let author = try m.attr("data-author")
             let date = (try m.select("time").first()?.text()) ?? ""
             guard let body = try m.select(".bbWrapper").first() else { continue }
+            let digits = ((try? m.attr("data-content")) ?? "").filter(\.isNumber)
+            let postID = digits.isEmpty ? UUID().uuidString : digits
 
             // Link preview cards (unfurl blocks)
             var cards: [LinkCard] = []
@@ -268,7 +290,7 @@ enum Parser {
             var r = Rendered()
             render(body, into: &r, link: nil, inQuote: false)
             r.flush()
-            out.append(Post(author: author, date: date, parts: r.parts, images: images, cards: cards))
+            out.append(Post(postID: postID, author: author, date: date, parts: r.parts, images: images, cards: cards))
         }
         if out.isEmpty { throw noResults(doc, what: "Сообщений") }
         return (out, pageCount(doc))

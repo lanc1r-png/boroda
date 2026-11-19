@@ -411,19 +411,31 @@ struct RootView: View {
 
 // MARK: - Search (thread titles)
 
+enum SearchScope: String, CaseIterable, Identifiable {
+    case everywhere = "Везде"
+    case titles = "Заголовки"
+    var id: String { rawValue }
+}
+
 struct SearchView: View {
     @State private var query = ""
+    @State private var scope: SearchScope = .everywhere
     @State private var state: LoadState<[ThreadItem]> = .idle
+    @State private var page = 1
+    @State private var pages = 1
+    @State private var resultsURL: URL?
+    @State private var loadingMore = false
+    @State private var moreError: String?
 
     var body: some View {
         NavigationStack {
             Group {
                 if case .idle = state {
-                    ContentUnavailableView("Поиск по названиям тем", systemImage: "magnifyingglass",
-                                           description: Text("Введите запрос и нажмите «Поиск»."))
+                    ContentUnavailableView("Поиск по форуму", systemImage: "magnifyingglass",
+                                           description: Text("Ищет слова в сообщениях. Нажмите на результат, чтобы перейти прямо к сообщению."))
                 } else {
                     StateView(state: state, retry: run) { items in
-                        ThreadListView(items: items, reload: run)
+                        resultsList(items)
                     }
                 }
             }
@@ -431,19 +443,74 @@ struct SearchView: View {
             .toolbar { ToolbarItem(placement: .topBarTrailing) { TranslateButton() } }
             .navigationDestination(for: ThreadItem.self) { ThreadView(item: $0) }
         }
-        .searchable(text: $query, prompt: "Название темы")
+        .searchable(text: $query, prompt: "Слово или фраза")
+        .searchScopes($scope) {
+            ForEach(SearchScope.allCases) { Text($0.rawValue).tag($0) }
+        }
         .onSubmit(of: .search) { Task { await run() } }
+        .onChange(of: scope) { _, _ in Task { await run() } }
+    }
+
+    @ViewBuilder
+    private func resultsList(_ items: [ThreadItem]) -> some View {
+        ScrollView {
+            LazyVStack(spacing: 10) {
+                ForEach(items) { t in
+                    NavigationLink(value: t) { ThreadRow(item: t) }.buttonStyle(.plain)
+                }
+                if page < pages {
+                    Button(loadingMore ? "Загрузка…" : "Показать ещё") { Task { await more() } }
+                        .buttonStyle(.glass)
+                        .disabled(loadingMore)
+                        .padding()
+                }
+                if let moreError {
+                    Text(moreError).font(.footnote).foregroundStyle(.secondary).padding(.horizontal)
+                }
+            }
+            .padding(.horizontal)
+        }
+        .refreshable { await run() }
+        .translateTexts(items.map(\.title) + items.map(\.meta))
     }
 
     private func run() async {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { return }
         state = .loading
+        page = 1
+        pages = 1
+        moreError = nil
         do {
-            let html = try await WebLoader.shared.search(q)
-            state = .loaded(try Parser.latest(html))
+            let html = try await WebLoader.shared.search(q, titleOnly: scope == .titles)
+            let r = try Parser.searchResults(html)
+            resultsURL = WebLoader.shared.webView.url
+            pages = max(r.pages, 1)
+            state = .loaded(r.items)
         } catch {
             state = .failed(error.localizedDescription)
+        }
+    }
+
+    private func more() async {
+        guard case .loaded(let current) = state, let base = resultsURL, !loadingMore else { return }
+        loadingMore = true
+        moreError = nil
+        defer { loadingMore = false }
+        var c = URLComponents(url: base, resolvingAgainstBaseURL: false)
+        var qi = (c?.queryItems ?? []).filter { $0.name != "page" }
+        qi.append(URLQueryItem(name: "page", value: String(page + 1)))
+        c?.queryItems = qi
+        guard let url = c?.url else { return }
+        do {
+            let html = try await WebLoader.shared.html(url)
+            let r = try Parser.searchResults(html)
+            let known = Set(current.map(\.id))
+            state = .loaded(current + r.items.filter { !known.contains($0.id) })
+            page += 1
+            pages = max(pages, r.pages)
+        } catch {
+            moreError = error.localizedDescription
         }
     }
 }
@@ -759,10 +826,18 @@ struct QuoteView: View {
 
 struct PostView: View {
     let post: Post
+    var highlight = false
     let onImage: (UIImage) -> Void
     private let tx = TranslationStore.shared
 
     var body: some View {
+        card.overlay(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .stroke(Color.accentColor, lineWidth: highlight ? 2.5 : 0)
+        )
+    }
+
+    private var card: some View {
         Card {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
@@ -811,6 +886,9 @@ struct ThreadView: View {
     @State private var canonical: URL?
     @State private var scrollKey = 0
     @State private var viewer: ViewerImage?
+    @State private var targetPost: String?
+    @State private var highlightID: String?
+    @State private var pendingScroll: String?
     private let store = BookmarkStore.shared
     private let tx = TranslationStore.shared
 
@@ -826,25 +904,37 @@ struct ThreadView: View {
     }
 
     var body: some View {
-        ScrollView {
-            LazyVStack(spacing: 10) {
-                ForEach(posts) { p in
-                    PostView(post: p) { viewer = ViewerImage(image: $0) }
-                }
-                if loading {
-                    ProgressView().padding(40)
-                }
-                if let error {
-                    VStack(spacing: 10) {
-                        Text(error).font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
-                        Button("Повторить") { Task { await load(target) } }.buttonStyle(.glass)
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(spacing: 10) {
+                    ForEach(posts) { p in
+                        PostView(post: p, highlight: p.postID == highlightID) {
+                            viewer = ViewerImage(image: $0)
+                        }
                     }
-                    .padding()
+                    if loading {
+                        ProgressView().padding(40)
+                    }
+                    if let error {
+                        VStack(spacing: 10) {
+                            Text(error).font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                            Button("Повторить") { Task { await load(target) } }.buttonStyle(.glass)
+                        }
+                        .padding()
+                    }
+                }
+                .padding(.horizontal)
+            }
+            .id(scrollKey)
+            .onChange(of: scrollKey) { _, _ in
+                guard let t = pendingScroll else { return }
+                pendingScroll = nil
+                Task {
+                    try? await Task.sleep(nanoseconds: 400_000_000)
+                    withAnimation { proxy.scrollTo(t, anchor: .top) }
                 }
             }
-            .padding(.horizontal)
         }
-        .id(scrollKey)
         .pageToolbar(page: page, pages: pages) { n in Task { await load(n) } }
         .navigationTitle(tx.tr(item.title))
         .navigationBarTitleDisplayMode(.inline)
@@ -877,20 +967,29 @@ struct ThreadView: View {
             posts = r.posts
             pages = max(r.pages, 1)
             page = n
-            scrollKey += 1
-            if canonical == nil, let cur = WebLoader.shared.webView.url {
-                // Links like /posts/123/ redirect to /threads/slug/page-N: normalise.
-                var comps = URLComponents(url: cur, resolvingAgainstBaseURL: false)
-                comps?.fragment = nil
-                comps?.query = nil
-                var b = comps?.url ?? cur
-                if b.lastPathComponent.hasPrefix("page-") {
-                    page = Int(b.lastPathComponent.dropFirst(5)) ?? n
-                    pages = max(pages, page)
-                    b = b.deletingLastPathComponent()
+            if canonical == nil {
+                if let cur = WebLoader.shared.webView.url {
+                    // Links like /posts/123/ redirect to /threads/slug/page-N#post-123: normalise.
+                    targetPost = Parser.postID(from: item.url) ?? Parser.postID(from: cur)
+                    var comps = URLComponents(url: cur, resolvingAgainstBaseURL: false)
+                    comps?.fragment = nil
+                    comps?.query = nil
+                    var b = comps?.url ?? cur
+                    if b.lastPathComponent.hasPrefix("page-") {
+                        page = Int(b.lastPathComponent.dropFirst(5)) ?? n
+                        pages = max(pages, page)
+                        b = b.deletingLastPathComponent()
+                    }
+                    canonical = b
                 }
-                canonical = b
+                if let t = targetPost, r.posts.contains(where: { $0.postID == t }) {
+                    highlightID = t
+                    pendingScroll = t
+                }
+            } else {
+                highlightID = nil
             }
+            scrollKey += 1
         case .failed(let m):
             error = m
         default:
